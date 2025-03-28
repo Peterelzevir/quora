@@ -17,9 +17,19 @@ mongoose.connect(config.mongoUri, {
     console.error('Error pas nyambung ke MongoDB:', err);
 });
 
-// Database Models
+// dan tidak pernah null
 const UserSchema = new mongoose.Schema({
-    userId: { type: String, required: true, unique: true },
+    userId: { 
+        type: String, 
+        required: true, 
+        unique: true,
+        validate: {
+            validator: function(v) {
+                return v != null && v !== '';
+            },
+            message: props => `${props.value} bukan userId yang valid!`
+        }
+    },
     username: String,
     firstName: String,
     limit: { type: Number, default: 0 },
@@ -48,18 +58,33 @@ const User = mongoose.model('User', UserSchema);
 const Order = mongoose.model('Order', OrderSchema);
 const Code = mongoose.model('Code', CodeSchema);
 
-// Helper Functions
+// Ubah fungsi getUser menjadi seperti ini:
 const getUser = async (ctx) => {
+    // Pastikan ctx.from dan ctx.from.id tidak null atau undefined
+    if (!ctx.from || !ctx.from.id) {
+        throw new Error('User ID tidak tersedia dalam context');
+    }
+    
     const userId = ctx.from.id.toString();
     let user = await User.findOne({ userId });
     
     if (!user) {
-        user = new User({
-            userId,
-            username: ctx.from.username || '',
-            firstName: ctx.from.first_name || ''
-        });
-        await user.save();
+        try {
+            user = new User({
+                userId,
+                username: ctx.from.username || '',
+                firstName: ctx.from.first_name || ''
+            });
+            await user.save();
+        } catch (error) {
+            // Jika terjadi error duplikasi, coba ambil user yang sudah ada
+            if (error.code === 11000) {
+                console.log('Duplikasi ID terdeteksi, mencoba mengambil user dari database');
+                user = await User.findOne({ userId });
+                if (user) return user;
+            }
+            throw error; // Throw error lain jika bukan masalah duplikasi
+        }
     }
     
     return user;
@@ -360,14 +385,24 @@ bot.action('check_all_limits', async (ctx) => {
 
 // Check limit
 bot.action('check_limit', async (ctx) => {
-    const user = await getUser(ctx);
-    
-    await ctx.editMessageText(`💰 *Limit Lu* 💰\n\nLu punya *${user.limit} link* tersisa nih.`, {
-        parse_mode: 'Markdown',
-        ...Markup.inlineKeyboard([
-            [Markup.button.callback('🔙 Balik ke Menu User', 'user_menu')]
-        ])
-    });
+    try {
+        // Validasi ctx.from terlebih dahulu
+        if (!ctx.from) {
+            return await ctx.answerCbQuery('Terjadi kesalahan. Coba mulai bot dari awal dengan /start');
+        }
+        
+        const user = await getUser(ctx);
+        
+        await ctx.editMessageText(`💰 *Limit Lu* 💰\n\nLu punya *${user.limit} link* tersisa nih.`, {
+            parse_mode: 'Markdown',
+            ...Markup.inlineKeyboard([
+                [Markup.button.callback('🔙 Balik ke Menu User', 'user_menu')]
+            ])
+        });
+    } catch (error) {
+        console.error('Error pada handler check_limit:', error);
+        await ctx.answerCbQuery('Terjadi kesalahan, coba lagi.');
+    }
 });
 
 // Order feature
