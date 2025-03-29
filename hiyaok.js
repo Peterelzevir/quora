@@ -1,966 +1,824 @@
 // index.js
 const { Telegraf, Markup, Scenes, session } = require('telegraf');
-const mongoose = require('mongoose');
+const { MongoClient } = require('mongodb');
 const axios = require('axios');
 const fs = require('fs');
 const crypto = require('crypto');
 const config = require('./config');
-const bot = new Telegraf(config.botToken);
+
+// Initialize bot
+const bot = new Telegraf(config.telegramToken);
+
+// Global error handler to prevent bot crashes
+process.on('uncaughtException', (error) => {
+    console.error('Uncaught Exception:', error);
+    
+    // Notify admins about error
+    for (const adminId of config.adminId) {
+        try {
+            bot.telegram.sendMessage(adminId, 
+                `⚠️ *Bot Error Alert*\n\nUncaught exception: ${error.message}\n\nBot is still running.`, 
+                { parse_mode: 'Markdown' }
+            );
+        } catch (e) {
+            console.error(`Failed to notify admin about error:`, e);
+        }
+    }
+});
+
+process.on('unhandledRejection', (reason, promise) => {
+    console.error('Unhandled Rejection at:', promise, 'reason:', reason);
+    
+    // Notify admins about rejection
+    for (const adminId of config.adminId) {
+        try {
+            bot.telegram.sendMessage(adminId, 
+                `⚠️ *Bot Error Alert*\n\nUnhandled promise rejection: ${reason}\n\nBot is still running.`, 
+                { parse_mode: 'Markdown' }
+            );
+        } catch (e) {
+            console.error(`Failed to notify admin about rejection:`, e);
+        }
+    }
+});
 
 // Connect to MongoDB
-mongoose.connect(config.mongoUri, {
-    useNewUrlParser: true,
-    useUnifiedTopology: true
-}).then(() => {
-    console.log('Sukses terhubung ke MongoDB Atlas');
-}).catch(err => {
-    console.error('Error pas nyambung ke MongoDB:', err);
+let db;
+let usersCollection;
+let codesCollection;
+let ordersCollection;
+
+async function connectToMongoDB() {
+    try {
+        const client = new MongoClient(config.mongoUri, { useNewUrlParser: true, useUnifiedTopology: true });
+        await client.connect();
+        console.log('Connected to MongoDB');
+        
+        db = client.db('orderBot');
+        usersCollection = db.collection('users');
+        codesCollection = db.collection('codes');
+        ordersCollection = db.collection('orders');
+        
+        // Create indexes
+        await usersCollection.createIndex({ userId: 1 }, { unique: true });
+        await codesCollection.createIndex({ code: 1 }, { unique: true });
+        await ordersCollection.createIndex({ orderId: 1 }, { unique: true });
+    } catch (error) {
+        console.error('Error connecting to MongoDB:', error);
+        process.exit(1);
+    }
+}
+
+// Function for safe DB operations
+async function safeDBOperation(operation, fallback = null) {
+    try {
+        return await operation();
+    } catch (error) {
+        console.error('Database operation error:', error);
+        return fallback;
+    }
+}
+
+// Scene for adding codes
+const addCodeScene = new Scenes.BaseScene('addCode');
+
+addCodeScene.enter(async (ctx) => {
+    await ctx.reply('🔑 Masukkan jumlah limit yang ingin dibuat:', {
+        reply_markup: { remove_keyboard: true }
+    });
 });
 
-// dan tidak pernah null
-const UserSchema = new mongoose.Schema({
-    userId: { 
-        type: String, 
-        required: true, 
-        unique: true,
-        validate: {
-            validator: function(v) {
-                return v != null && v !== '';
-            },
-            message: props => `${props.value} bukan userId yang valid!`
-        }
-    },
-    username: String,
-    firstName: String,
-    limit: { type: Number, default: 0 },
-    createdAt: { type: Date, default: Date.now }
-});
-
-const OrderSchema = new mongoose.Schema({
-    userId: { type: String, required: true },
-    links: [String],
-    orderIds: [String],
-    status: { type: String, default: 'Pending' },
-    createdAt: { type: Date, default: Date.now }
-});
-
-const CodeSchema = new mongoose.Schema({
-    code: { type: String, required: true, unique: true },
-    limit: { type: Number, required: true },
-    used: { type: Boolean, default: false },
-    createdBy: String,
-    usedBy: String,
-    createdAt: { type: Date, default: Date.now },
-    usedAt: Date
-});
-
-const User = mongoose.model('User', UserSchema);
-const Order = mongoose.model('Order', OrderSchema);
-const Code = mongoose.model('Code', CodeSchema);
-
-// Ubah fungsi getUser menjadi seperti ini:
-const getUser = async (ctx) => {
-    // Pastikan ctx.from dan ctx.from.id tidak null atau undefined
-    if (!ctx.from || !ctx.from.id) {
-        throw new Error('User ID tidak tersedia dalam context');
+addCodeScene.on('text', async (ctx) => {
+    const amount = parseInt(ctx.message.text.trim());
+    
+    if (isNaN(amount) || amount <= 0) {
+        await ctx.reply('❌ Jumlah tidak valid. Silakan masukkan angka positif.');
+        return;
     }
     
-    const userId = ctx.from.id.toString();
-    let user = await User.findOne({ userId });
+    try {
+        // Generate unique code
+        const code = crypto.randomBytes(8).toString('hex');
+        
+        // Create the redemption code in database
+        await codesCollection.insertOne({
+            code,
+            amount,
+            createdBy: ctx.from.id,
+            createdAt: new Date(),
+            isRedeemed: false
+        });
+        
+        // Create code file
+        const codeData = {
+            code,
+            amount,
+            createdAt: new Date().toISOString()
+        };
+        
+        const fileName = `code_${code}.json`;
+        fs.writeFileSync(fileName, JSON.stringify(codeData, null, 2));
+        
+        // Send the file to admin
+        await ctx.replyWithDocument({ source: fileName }, {
+            caption: `✅ Code berhasil dibuat!\n\n🔑 Code: ${code}\n🔢 Jumlah Limit: ${amount}`
+        });
+        
+        // Delete the file after sending
+        fs.unlinkSync(fileName);
+        
+        // Exit the scene
+        await ctx.scene.leave();
+        await showAdminMenu(ctx);
+    } catch (error) {
+        console.error('Error generating code:', error);
+        await ctx.reply('❌ Terjadi kesalahan saat membuat code.');
+        await ctx.scene.leave();
+        await showAdminMenu(ctx);
+    }
+});
+
+// Scene for processing orders
+const orderScene = new Scenes.BaseScene('order');
+
+orderScene.enter(async (ctx) => {
+    await ctx.reply('📋 Silakan kirimkan link yang ingin diproses (satu atau lebih, tiap link di baris baru):', {
+        reply_markup: { remove_keyboard: true }
+    });
+});
+
+orderScene.on('text', async (ctx) => {
+    const links = ctx.message.text.trim().split('\n').filter(link => link.trim().startsWith('http'));
     
-    if (!user) {
-        try {
-            user = new User({
-                userId,
-                username: ctx.from.username || '',
-                firstName: ctx.from.first_name || ''
-            });
-            await user.save();
-        } catch (error) {
-            // Jika terjadi error duplikasi, coba ambil user yang sudah ada
-            if (error.code === 11000) {
-                console.log('Duplikasi ID terdeteksi, mencoba mengambil user dari database');
-                user = await User.findOne({ userId });
-                if (user) return user;
+    if (links.length === 0) {
+        await ctx.reply('❌ Tidak ada link valid yang ditemukan. Link harus dimulai dengan http atau https.');
+        return;
+    }
+    
+    const userId = ctx.from.id;
+    const user = await usersCollection.findOne({ userId });
+    
+    if (!user || user.limit < links.length) {
+        await ctx.reply(`❌ Limit tidak mencukupi. Anda membutuhkan ${links.length} limit, tetapi hanya memiliki ${user ? user.limit : 0} limit.`, {
+            reply_markup: Markup.inlineKeyboard([
+                Markup.button.url('💬 Hubungi Admin', 't.me/hiyaok')
+            ])
+        });
+        await ctx.scene.leave();
+        return;
+    }
+    
+    ctx.session.links = links;
+    ctx.session.totalLinks = links.length;
+    
+    await ctx.reply(`📝 Ditemukan ${links.length} link. Anda memiliki ${user.limit} limit.`, {
+        reply_markup: Markup.inlineKeyboard([
+            [Markup.button.callback('✅ Order', 'confirm_order')],
+            [Markup.button.callback('❌ Batalkan', 'cancel_order')]
+        ])
+    });
+});
+
+orderScene.action('confirm_order', async (ctx) => {
+    await ctx.editMessageText('🔄 Apakah Anda yakin ingin melanjutkan order? Setelah dikonfirmasi, order tidak dapat dibatalkan.', {
+        reply_markup: Markup.inlineKeyboard([
+            [Markup.button.callback('✅ 100% Yakin', 'process_order')],
+            [Markup.button.callback('❌ Batalkan', 'cancel_order')]
+        ])
+    });
+});
+
+orderScene.action('process_order', async (ctx) => {
+    try {
+        await ctx.editMessageText('🔄 Memproses order...');
+        
+        const userId = ctx.from.id;
+        const username = ctx.from.username ? `@${ctx.from.username}` : ctx.from.first_name;
+        const { links } = ctx.session;
+        
+        // Notify admin about new order
+        for (const adminId of config.adminId) {
+            try {
+                await bot.telegram.sendMessage(adminId, 
+                    `🛒 *Order Baru!*\n\n👤 User: ${username}\n🆔 ID: \`${userId}\`\n🔢 Jumlah Link: ${links.length}`, 
+                    { parse_mode: 'Markdown' }
+                );
+            } catch (e) {
+                console.error(`Failed to notify admin ${adminId}:`, e);
             }
-            throw error; // Throw error lain jika bukan masalah duplikasi
-        }
-    }
-    
-    return user;
-};
-
-const isAdmin = (ctx) => {
-    return config.adminId.includes(ctx.from.id.toString());
-};
-
-const generateCodeFile = (code, limit) => {
-    const data = {
-        code,
-        limit,
-        generatedAt: new Date().toISOString()
-    };
-    
-    const fileName = `code_${code}.json`;
-    fs.writeFileSync(fileName, JSON.stringify(data, null, 2));
-    
-    return fileName;
-};
-
-const verifyCodeFile = (filePath) => {
-    try {
-        const data = JSON.parse(fs.readFileSync(filePath, 'utf8'));
-        if (!data.code || !data.limit) {
-            return null;
-        }
-        return data;
-    } catch (error) {
-        console.error('Error pas verifikasi file code:', error);
-        return null;
-    }
-};
-
-const checkOrderStatus = async (orderId) => {
-    try {
-        const response = await axios.post(config.apiUrl, {
-            api_key: config.apiKey,
-            action: 'status',
-            secret_key: config.secretKey,
-            id: orderId
-        });
-        
-        if (response.data && response.data.status === true) {
-            return response.data.data;
         }
         
-        return null;
-    } catch (error) {
-        console.error('Error pas cek status pesanan:', error);
-        return null;
-    }
-};
-
-const placeOrder = async (serviceId, link, quantity) => {
-    try {
-        const response = await axios.post(config.apiUrl, {
-            api_key: config.apiKey,
-            action: 'order',
-            secret_key: config.secretKey,
-            service: serviceId,
-            data: link,
-            quantity: quantity
-        });
-        
-        if (response.data && response.data.status === true) {
-            return response.data.data.id;
-        }
-        
-        return null;
-    } catch (error) {
-        console.error('Error pas bikin pesanan:', error);
-        return null;
-    }
-};
-
-const getServices = async () => {
-    try {
-        const response = await axios.post(config.apiUrl, {
+        // Get services first
+        const servicesResponse = await axios.post(config.apiUrl, {
             api_key: config.apiKey,
             action: 'services',
             secret_key: config.secretKey
         });
         
-        if (response.data && response.data.status === true) {
-            return response.data.data;
+        if (!servicesResponse.data.status) {
+            throw new Error('Gagal mendapatkan layanan dari API');
         }
         
-        return [];
-    } catch (error) {
-        console.error('Error pas ambil layanan:', error);
-        return [];
-    }
-};
-
-const validateServices = async () => {
-    const services = await getServices();
-    
-    // Find the viewers service
-    const viewersService = services.find(s => s.id.toString() === config.services.viewers);
-    if (!viewersService || viewersService.price > 10000) {
-        return false;
-    }
-    
-    // Find the upvotes service
-    const upvotesService = services.find(s => s.id.toString() === config.services.upvotes);
-    if (!upvotesService || upvotesService.price > 150000) {
-        return false;
-    }
-    
-    return true;
-};
-
-// Generate a random code
-const generateRandomCode = (length = 8) => {
-    return crypto.randomBytes(length).toString('hex').slice(0, length).toUpperCase();
-};
-
-// Bot commands and handlers
-bot.use(session());
-
-// Start command
-bot.start(async (ctx) => {
-    const user = await getUser(ctx);
-    
-    const welcomeMessage = `🚀 *Halo, Selamat Datang di Bot Auto Order* 🚀\n\nHai ${ctx.from.first_name}!\n\nLimit kamu sekarang: *${user.limit}* link`;
-    
-    const keyboard = isAdmin(ctx) ? 
-        Markup.inlineKeyboard([
-            [Markup.button.callback('👤 Menu User', 'user_menu')],
-            [Markup.button.callback('👑 Menu Admin', 'admin_menu')]
-        ]) :
-        Markup.inlineKeyboard([
-            [Markup.button.callback('🛒 Order', 'order')],
-            [Markup.button.callback('💰 Cek Limit', 'check_limit')],
-            [Markup.button.callback('📜 Riwayat Order', 'order_history')],
-            [Markup.button.callback('🎁 Redeem Code', 'redeem_code')]
-        ]);
-    
-    await ctx.reply(welcomeMessage, {
-        parse_mode: 'Markdown',
-        ...keyboard
-    });
-});
-
-// Admin menu
-bot.action('admin_menu', async (ctx) => {
-    if (!isAdmin(ctx)) {
-        return await ctx.answerCbQuery('Lu gak punya akses ke menu ini broo!');
-    }
-    
-    await ctx.editMessageText('👑 *Menu Admin* 👑\n\nPilih menu yang lu mau:', {
-        parse_mode: 'Markdown',
-        ...Markup.inlineKeyboard([
-            [Markup.button.callback('➕ Tambah Code', 'add_code')],
-            [Markup.button.callback('👥 Cek Limit User', 'check_all_limits')],
-            [Markup.button.callback('🏠 Balik ke Menu Utama', 'back_to_main')]
-        ])
-    });
-});
-
-// User menu
-bot.action('user_menu', async (ctx) => {
-    const user = await getUser(ctx);
-    
-    await ctx.editMessageText(`👤 *Menu User* 👤\n\nLimit lu sekarang: *${user.limit}* link`, {
-        parse_mode: 'Markdown',
-        ...Markup.inlineKeyboard([
-            [Markup.button.callback('🛒 Order', 'order')],
-            [Markup.button.callback('💰 Cek Limit', 'check_limit')],
-            [Markup.button.callback('📜 Riwayat Order', 'order_history')],
-            [Markup.button.callback('🎁 Redeem Code', 'redeem_code')],
-            [Markup.button.callback('🏠 Balik ke Menu Utama', 'back_to_main')]
-        ])
-    });
-});
-
-// Back to main menu
-bot.action('back_to_main', async (ctx) => {
-    const user = await getUser(ctx);
-    
-    const welcomeMessage = `🚀 *Bot Auto Order* 🚀\n\nHai ${ctx.from.first_name}!\n\nLimit kamu sekarang: *${user.limit}* link`;
-    
-    const keyboard = isAdmin(ctx) ? 
-        Markup.inlineKeyboard([
-            [Markup.button.callback('👤 Menu User', 'user_menu')],
-            [Markup.button.callback('👑 Menu Admin', 'admin_menu')]
-        ]) :
-        Markup.inlineKeyboard([
-            [Markup.button.callback('🛒 Order', 'order')],
-            [Markup.button.callback('💰 Cek Limit', 'check_limit')],
-            [Markup.button.callback('📜 Riwayat Order', 'order_history')],
-            [Markup.button.callback('🎁 Redeem Code', 'redeem_code')]
-        ]);
-    
-    await ctx.editMessageText(welcomeMessage, {
-        parse_mode: 'Markdown',
-        ...keyboard
-    });
-});
-
-// ---- ADMIN FEATURES ----
-
-// Add code feature
-bot.action('add_code', async (ctx) => {
-    if (!isAdmin(ctx)) {
-        return await ctx.answerCbQuery('Lu bukan admin woyy!');
-    }
-    
-    await ctx.editMessageText('➕ *Tambah Code* ➕\n\nMasukkan jumlah limit buat code ini dengan format:\n`/addcode <jumlah>`', {
-        parse_mode: 'Markdown',
-        ...Markup.inlineKeyboard([
-            [Markup.button.callback('🔙 Balik ke Menu Admin', 'admin_menu')]
-        ])
-    });
-});
-
-bot.command('addcode', async (ctx) => {
-    if (!isAdmin(ctx)) {
-        return await ctx.reply('❌ Lu bukan admin woyy, gak bisa pake command ini!');
-    }
-    
-    const args = ctx.message.text.split(' ');
-    if (args.length !== 2) {
-        return await ctx.reply('❌ Format salah bro. Pake: `/addcode <jumlah>`', {
-            parse_mode: 'Markdown'
-        });
-    }
-    
-    const limit = parseInt(args[1], 10);
-    if (isNaN(limit) || limit <= 0) {
-        return await ctx.reply('❌ Jumlah limit ga valid. Kasih angka positif ya!');
-    }
-    
-    // Generate a random code
-    const codeValue = generateRandomCode();
-    
-    // Save to database
-    const code = new Code({
-        code: codeValue,
-        limit,
-        createdBy: ctx.from.id.toString()
-    });
-    
-    await code.save();
-    
-    // Generate a file for this code
-    const fileName = generateCodeFile(codeValue, limit);
-    
-    // Send the file to admin
-    await ctx.replyWithDocument({
-        source: fileName,
-        filename: `limit_code_${limit}.json`
-    }, {
-        caption: `✅ *Code Berhasil Dibuat*\n\nCode: \`${codeValue}\`\nLimit: ${limit}\n\nFile ini bisa dipake user buat redeem limit.`,
-        parse_mode: 'Markdown'
-    });
-    
-    // Delete the file after sending
-    fs.unlinkSync(fileName);
-});
-
-// Check all user limits
-bot.action('check_all_limits', async (ctx) => {
-    if (!isAdmin(ctx)) {
-        return await ctx.answerCbQuery('Lu bukan admin woyy!');
-    }
-    
-    const users = await User.find().sort('-limit');
-    
-    if (users.length === 0) {
-        return await ctx.editMessageText('❌ Belum ada user nih di database.', {
-            ...Markup.inlineKeyboard([
-                [Markup.button.callback('🔙 Balik ke Menu Admin', 'admin_menu')]
-            ])
-        });
-    }
-    
-    let message = '👥 *Limit Semua User* 👥\n\n';
-    
-    for (const user of users) {
-        message += `ID: ${user.userId}\n`;
-        message += `Username: ${user.username ? '@' + user.username : 'N/A'}\n`;
-        message += `Nama: ${user.firstName || 'N/A'}\n`;
-        message += `Limit: ${user.limit}\n\n`;
-    }
-    
-    await ctx.editMessageText(message, {
-        parse_mode: 'Markdown',
-        ...Markup.inlineKeyboard([
-            [Markup.button.callback('🔙 Balik ke Menu Admin', 'admin_menu')]
-        ])
-    });
-});
-
-// ---- USER FEATURES ----
-
-// Check limit
-bot.action('check_limit', async (ctx) => {
-    try {
-        // Validasi ctx.from terlebih dahulu
-        if (!ctx.from) {
-            return await ctx.answerCbQuery('Terjadi kesalahan. Coba mulai bot dari awal dengan /start');
+        // Validate service IDs exist and check prices
+        const services = servicesResponse.data.data;
+        const firstService = services.find(s => s.id.toString() === config.serviceIds.first);
+        const secondService = services.find(s => s.id.toString() === config.serviceIds.second);
+        
+        if (!firstService || !secondService) {
+            throw new Error('Service ID tidak ditemukan');
         }
         
-        const user = await getUser(ctx);
+        if (firstService.price > 10000) {
+            throw new Error(`Service ID ${config.serviceIds.first} melebihi harga maksimal 10.000`);
+        }
         
-        await ctx.editMessageText(`💰 *Limit Lu* 💰\n\nLu punya *${user.limit} link* tersisa nih.`, {
-            parse_mode: 'Markdown',
-            ...Markup.inlineKeyboard([
-                [Markup.button.callback('🔙 Balik ke Menu User', 'user_menu')]
-            ])
-        });
-    } catch (error) {
-        console.error('Error pada handler check_limit:', error);
-        await ctx.answerCbQuery('Terjadi kesalahan, coba lagi.');
-    }
-});
-
-// Order feature
-bot.action('order', async (ctx) => {
-    const user = await getUser(ctx);
-    
-    if (user.limit <= 0) {
-        await ctx.editMessageText('❌ *Limit Lu Kurang* ❌\n\nGa cukup limit buat order nih. Lu mesti kontak admin buat nambah limit.', {
-            parse_mode: 'Markdown',
-            ...Markup.inlineKeyboard([
-                [Markup.button.callback('💬 Kontak Admin', 'contact_admin')],
-                [Markup.button.callback('🔙 Balik ke Menu User', 'user_menu')]
-            ])
-        });
-        return;
-    }
-    
-    // Save user's state to session
-    ctx.session = {
-        ...ctx.session,
-        orderState: 'awaiting_links'
-    };
-    
-    await ctx.editMessageText(`🛒 *Buat Pesanan* 🛒\n\nLu punya *${user.limit} link* tersisa.\n\nKirim link Quora lu, satu per baris ya. Tiap link pake 1 limit.`, {
-        parse_mode: 'Markdown',
-        ...Markup.inlineKeyboard([
-            [Markup.button.callback('❌ Batal', 'cancel_order')]
-        ])
-    });
-});
-
-bot.action('cancel_order', async (ctx) => {
-    delete ctx.session.orderState;
-    delete ctx.session.orderLinks;
-    
-    await ctx.editMessageText('🚫 Order dibatalin.', {
-        ...Markup.inlineKeyboard([
-            [Markup.button.callback('🔙 Balik ke Menu User', 'user_menu')]
-        ])
-    });
-});
-
-bot.action('contact_admin', async (ctx) => {
-    await ctx.editMessageText('💬 *Kontak Admin* 💬\n\nNih kontak admin kita buat nambah limit:\n\n@hiyaok', {
-        parse_mode: 'Markdown',
-        ...Markup.inlineKeyboard([
-            [Markup.button.url('💬 Chat Admin', 't.me/hiyaok')],
-            [Markup.button.callback('🔙 Balik ke Menu User', 'user_menu')]
-        ])
-    });
-});
-
-// Process links for order
-bot.on('text', async (ctx) => {
-    if (!ctx.session || !ctx.session.orderState) {
-        return;
-    }
-    
-    if (ctx.session.orderState === 'awaiting_links') {
-        const user = await getUser(ctx);
-        const lines = ctx.message.text.split('\n').filter(line => line.trim());
+        if (secondService.price > 150000) {
+            throw new Error(`Service ID ${config.serviceIds.second} melebihi harga maksimal 150.000`);
+        }
         
-        // Validate links
-        const validLinks = lines.filter(link => link.startsWith('http'));
-        
-        if (validLinks.length === 0) {
-            await ctx.reply('❌ Ga ada link valid nih. Kirim link yang dimulai dengan http atau https, satu per baris.', {
-                ...Markup.inlineKeyboard([
-                    [Markup.button.callback('❌ Batal Order', 'cancel_order')]
-                ])
+        // Process each link
+        const orderResults = [];
+        for (const [index, link] of links.entries()) {
+            await ctx.editMessageText(`🔄 Memproses link ${index + 1} dari ${links.length}...`);
+            
+            // First API order
+            const firstOrderResponse = await axios.post(config.apiUrl, {
+                api_key: config.apiKey,
+                action: 'order',
+                secret_key: config.secretKey,
+                service: config.serviceIds.first,
+                data: link,
+                quantity: config.quantities.first
             });
-            return;
-        }
-        
-        if (validLinks.length > user.limit) {
-            await ctx.reply(`❌ Limit lu ga cukup nih. Lu kirim ${validLinks.length} link tapi cuma punya ${user.limit} limit.`, {
-                ...Markup.inlineKeyboard([
-                    [Markup.button.callback('💬 Kontak Admin', 'contact_admin')],
-                    [Markup.button.callback('❌ Batal Order', 'cancel_order')]
-                ])
+            
+            if (!firstOrderResponse.data.status) {
+                throw new Error(`Gagal order API pertama untuk link ${index + 1}: ${firstOrderResponse.data.message || 'Unknown error'}`);
+            }
+            
+            // Second API order
+            const secondOrderResponse = await axios.post(config.apiUrl, {
+                api_key: config.apiKey,
+                action: 'order',
+                secret_key: config.secretKey,
+                service: config.serviceIds.second,
+                data: link,
+                quantity: config.quantities.second
             });
-            return;
+            
+            if (!secondOrderResponse.data.status) {
+                throw new Error(`Gagal order API kedua untuk link ${index + 1}: ${secondOrderResponse.data.message || 'Unknown error'}`);
+            }
+            
+            // Save order info
+            const orderInfo = {
+                userId,
+                link,
+                firstOrderId: firstOrderResponse.data.data.id,
+                secondOrderId: secondOrderResponse.data.data.id,
+                status: 'Pending',
+                createdAt: new Date()
+            };
+            
+            const result = await ordersCollection.insertOne(orderInfo);
+            orderResults.push({
+                orderId: result.insertedId,
+                firstOrderId: firstOrderResponse.data.data.id,
+                secondOrderId: secondOrderResponse.data.data.id
+            });
         }
         
-        ctx.session.orderLinks = validLinks;
-        
-        // Show order confirmation
-        let message = `🛒 *Konfirmasi Order* 🛒\n\nLu mau order buat ${validLinks.length} link:\n\n`;
-        
-        for (let i = 0; i < validLinks.length; i++) {
-            message += `${i + 1}. ${validLinks[i]}\n`;
-        }
-        
-        message += `\nIni bakal pake ${validLinks.length} dari limit lu. Lu punya ${user.limit} limit tersisa.`;
-        
-        // Delete user's message to keep the chat clean
-        await ctx.deleteMessage(ctx.message.message_id);
-        
-        await ctx.reply(message, {
-            parse_mode: 'Markdown',
-            ...Markup.inlineKeyboard([
-                [Markup.button.callback('✅ Konfirmasi Order', 'confirm_order')],
-                [Markup.button.callback('❌ Batal', 'cancel_order')]
-            ])
-        });
-    }
-});
-
-bot.action('confirm_order', async (ctx) => {
-    if (!ctx.session || !ctx.session.orderLinks) {
-        return await ctx.answerCbQuery('❌ Ga ada order yang lagi jalan. Mulai lagi ya.');
-    }
-    
-    await ctx.editMessageText('🔄 *Konfirmasi Final* 🔄\n\nKalo udah dikonfirmasi, order ini GAK BISA dibatalin. Lu yakin mau lanjut?', {
-        parse_mode: 'Markdown',
-        ...Markup.inlineKeyboard([
-            [Markup.button.callback('✅ Iya, gw 100% yakin', 'process_order')],
-            [Markup.button.callback('❌ Ga jadi deh', 'cancel_order')]
-        ])
-    });
-});
-
-bot.action('process_order', async (ctx) => {
-    if (!ctx.session || !ctx.session.orderLinks) {
-        return await ctx.answerCbQuery('❌ Ga ada order yang lagi jalan. Mulai lagi ya.');
-    }
-    
-    const links = ctx.session.orderLinks;
-    const user = await getUser(ctx);
-    
-    // Check if user still has enough limit
-    if (user.limit < links.length) {
-        await ctx.editMessageText('❌ *Error* ❌\n\nLimit lu udah ga cukup buat order ini.', {
-            parse_mode: 'Markdown',
-            ...Markup.inlineKeyboard([
-                [Markup.button.callback('🔙 Balik ke Menu User', 'user_menu')]
-            ])
-        });
-        return;
-    }
-    
-    // Validate services first
-    const servicesValid = await validateServices();
-    if (!servicesValid) {
-        await ctx.editMessageText('❌ *Error Layanan* ❌\n\nAda masalah sama konfigurasi layanan. Kontak admin ya.', {
-            parse_mode: 'Markdown',
-            ...Markup.inlineKeyboard([
-                [Markup.button.callback('💬 Kontak Admin', 'contact_admin')],
-                [Markup.button.callback('🔙 Balik ke Menu User', 'user_menu')]
-            ])
-        });
-        return;
-    }
-    
-    // Start processing
-    const processingMsg = await ctx.editMessageText('🔄 *Lagi Proses Order Lu* 🔄\n\n0/' + links.length + ' link diproses...', {
-        parse_mode: 'Markdown'
-    });
-    
-    // Create order in database
-    const order = new Order({
-        userId: user.userId,
-        links: links,
-        orderIds: []
-    });
-    
-    const orderIds = [];
-    let successCount = 0;
-    let errorCount = 0;
-    
-    // Process each link
-    for (let i = 0; i < links.length; i++) {
-        const link = links[i];
-        
-        // Update progress message
-        await ctx.telegram.editMessageText(
-            ctx.chat.id, 
-            processingMsg.message_id, 
-            null,
-            `🔄 *Lagi Proses Order Lu* 🔄\n\n${i}/${links.length} link diproses...\n\nLagi proses: ${link}`,
-            { parse_mode: 'Markdown' }
+        // Update user's limit
+        await usersCollection.updateOne(
+            { userId },
+            { $inc: { limit: -links.length } }
         );
         
-        try {
-            // Place order for viewers (24044)
-            const viewersOrderId = await placeOrder(config.services.viewers, link, config.viewersQuantity);
-            
-            // Place order for upvotes (24047)
-            const upvotesOrderId = await placeOrder(config.services.upvotes, link, config.upvotesQuantity);
-            
-            if (viewersOrderId && upvotesOrderId) {
-                orderIds.push(viewersOrderId, upvotesOrderId);
-                successCount++;
-            } else {
-                errorCount++;
-            }
-        } catch (error) {
-            console.error('Error pas proses order:', error);
-            errorCount++;
-        }
-    }
-    
-    // Update order with order IDs
-    order.orderIds = orderIds;
-    await order.save();
-    
-    // Update user limit
-    user.limit -= links.length;
-    await user.save();
-    
-    // Clear session data
-    delete ctx.session.orderState;
-    delete ctx.session.orderLinks;
-    
-    // Final message
-    let finalMessage = `✅ *Order Selesai* ✅\n\n`;
-    finalMessage += `Berhasil diproses: ${successCount}/${links.length} link\n`;
-    
-    if (errorCount > 0) {
-        finalMessage += `Gagal: ${errorCount} link\n`;
-    }
-    
-    finalMessage += `\nSisa limit lu: ${user.limit} link\n\n`;
-    finalMessage += `ID Order: ${order._id}\n`;
-    finalMessage += `Lu bisa cek status order di Riwayat Order.`;
-    
-    await ctx.telegram.editMessageText(
-        ctx.chat.id, 
-        processingMsg.message_id, 
-        null,
-        finalMessage,
-        { 
-            parse_mode: 'Markdown',
-            ...Markup.inlineKeyboard([
-                [Markup.button.callback('📜 Lihat Riwayat Order', 'order_history')],
-                [Markup.button.callback('🏠 Balik ke Menu Utama', 'back_to_main')]
-            ])
-        }
-    );
-});
-
-// Order history
-bot.action('order_history', async (ctx) => {
-    const user = await getUser(ctx);
-    
-    const orders = await Order.find({ userId: user.userId }).sort('-createdAt').limit(10);
-    
-    if (orders.length === 0) {
-        await ctx.editMessageText('📜 *Riwayat Order* 📜\n\nLu belum pernah order nih.', {
-            parse_mode: 'Markdown',
-            ...Markup.inlineKeyboard([
-                [Markup.button.callback('🔙 Balik ke Menu User', 'user_menu')]
+        // Generate success message
+        let successMessage = `✅ Order berhasil diproses!\n\n`;
+        successMessage += `📊 Detail Order:\n`;
+        successMessage += `📌 Jumlah Link: ${links.length}\n`;
+        successMessage += `🔢 Limit Terpakai: ${links.length}\n\n`;
+        
+        const user = await usersCollection.findOne({ userId });
+        successMessage += `🔄 Sisa Limit: ${user.limit}`;
+        
+        await ctx.editMessageText(successMessage, {
+            reply_markup: Markup.inlineKeyboard([
+                [Markup.button.callback('📊 Riwayat Order', 'view_history')]
             ])
         });
+        
+        // Notify admin about successful order completion
+        for (const adminId of config.adminId) {
+            try {
+                const orderSummary = `✅ *Order Selesai Diproses!*\n\n👤 User: ${ctx.from.username ? `@${ctx.from.username}` : ctx.from.first_name}\n🆔 ID: \`${userId}\`\n🔢 Jumlah Link: ${links.length}\n🔗 Order IDs: ${orderResults.map(o => o.orderId).join(', ')}`;
+                
+                await bot.telegram.sendMessage(adminId, orderSummary, {
+                    parse_mode: 'Markdown'
+                });
+            } catch (e) {
+                console.error(`Failed to notify admin ${adminId} about completion:`, e);
+            }
+        }
+        
+        await ctx.scene.leave();
+    } catch (error) {
+        console.error('Error processing order:', error);
+        await ctx.editMessageText(`❌ Terjadi kesalahan: ${error.message}`, {
+            reply_markup: Markup.inlineKeyboard([
+                [Markup.button.callback('🔙 Kembali ke Menu', 'back_to_menu')]
+            ])
+        });
+        await ctx.scene.leave();
+    }
+});
+
+orderScene.action('cancel_order', async (ctx) => {
+    await ctx.editMessageText('❌ Order dibatalkan.');
+    await ctx.scene.leave();
+    await showMainMenu(ctx);
+});
+
+// Scene for code redemption
+const redeemCodeScene = new Scenes.BaseScene('redeemCode');
+
+redeemCodeScene.enter(async (ctx) => {
+    await ctx.reply('📤 Silakan kirim file code yang ingin di-redeem:', {
+        reply_markup: { remove_keyboard: true }
+    });
+});
+
+redeemCodeScene.on('document', async (ctx) => {
+    try {
+        const fileId = ctx.message.document.file_id;
+        const fileInfo = await ctx.telegram.getFile(fileId);
+        const fileUrl = `https://api.telegram.org/file/bot${config.telegramToken}/${fileInfo.file_path}`;
+        
+        const response = await axios.get(fileUrl);
+        const codeData = response.data;
+        
+        if (!codeData || !codeData.code || !codeData.amount) {
+            await ctx.reply('❌ Format file tidak valid.');
+            await ctx.scene.leave();
+            await showMainMenu(ctx);
+            return;
+        }
+        
+        const code = codeData.code;
+        const codeDoc = await codesCollection.findOne({ code });
+        
+        if (!codeDoc) {
+            await ctx.reply('❌ Code tidak ditemukan.');
+            await ctx.scene.leave();
+            await showMainMenu(ctx);
+            return;
+        }
+        
+        if (codeDoc.isRedeemed) {
+            await ctx.reply('❌ Code sudah digunakan.');
+            await ctx.scene.leave();
+            await showMainMenu(ctx);
+            return;
+        }
+        
+        // Update code status
+        await codesCollection.updateOne(
+            { code },
+            { $set: { isRedeemed: true, redeemedBy: ctx.from.id, redeemedAt: new Date() } }
+        );
+        
+        // Update user's limit
+        const userId = ctx.from.id;
+        const user = await usersCollection.findOne({ userId });
+        
+        if (user) {
+            await usersCollection.updateOne(
+                { userId },
+                { $inc: { limit: codeDoc.amount } }
+            );
+        } else {
+            await usersCollection.insertOne({
+                userId,
+                username: ctx.from.username || null,
+                firstName: ctx.from.first_name,
+                lastName: ctx.from.last_name || null,
+                limit: codeDoc.amount,
+                createdAt: new Date()
+            });
+        }
+        
+        const updatedUser = await usersCollection.findOne({ userId });
+        
+        await ctx.reply(`✅ Code berhasil di-redeem!\n\n🔢 Limit Ditambahkan: ${codeDoc.amount}\n🔄 Total Limit Sekarang: ${updatedUser.limit}`);
+        await ctx.scene.leave();
+        await showMainMenu(ctx);
+    } catch (error) {
+        console.error('Error redeeming code:', error);
+        await ctx.reply('❌ Terjadi kesalahan saat meredeem code.');
+        await ctx.scene.leave();
+        await showMainMenu(ctx);
+    }
+});
+
+// Create scene manager
+const stage = new Scenes.Stage([addCodeScene, orderScene, redeemCodeScene]);
+
+// Add middleware for handling concurrent processing
+bot.use(async (ctx, next) => {
+    try {
+        // Set a timeout for operations
+        const timeoutPromise = new Promise((_, reject) => {
+            setTimeout(() => reject(new Error('Operation timed out')), 30000); // 30 seconds timeout
+        });
+        
+        // Race the next middleware against the timeout
+        await Promise.race([next(), timeoutPromise]);
+    } catch (error) {
+        console.error('Error in middleware:', error);
+        
+        // Only notify user if the context is still valid
+        try {
+            if (ctx.callbackQuery) {
+                await ctx.answerCbQuery('Terjadi kesalahan, silakan coba lagi').catch(() => {});
+            }
+            
+            // Don't interrupt user flow if they're in a scene
+            if (!ctx.session?.currentScene) {
+                await ctx.reply('❌ Terjadi kesalahan saat memproses permintaan Anda. Silakan coba lagi.').catch(() => {});
+            }
+        } catch (replyError) {
+            console.error('Error replying to user:', replyError);
+        }
+    }
+});
+
+// Middleware
+bot.use(session());
+bot.use(stage.middleware());
+
+// Check if user exists and create if not
+bot.use(async (ctx, next) => {
+    if (ctx.from) {
+        const userId = ctx.from.id;
+        const user = await safeDBOperation(async () => {
+            const existingUser = await usersCollection.findOne({ userId });
+            
+            if (!existingUser) {
+                await usersCollection.insertOne({
+                    userId,
+                    username: ctx.from.username || null,
+                    firstName: ctx.from.first_name,
+                    lastName: ctx.from.last_name || null,
+                    limit: 0,
+                    createdAt: new Date()
+                });
+            }
+            
+            return existingUser || await usersCollection.findOne({ userId });
+        }, { limit: 0 });
+    }
+    return next();
+});
+
+// Command handlers
+bot.start(async (ctx) => {
+    const userId = ctx.from.id;
+    
+    if (config.adminId.includes(userId.toString())) {
+        await showAdminMenu(ctx);
+    } else {
+        await showMainMenu(ctx);
+    }
+});
+
+bot.command('admin', async (ctx) => {
+    const userId = ctx.from.id;
+    
+    if (config.adminId.includes(userId.toString())) {
+        await showAdminMenu(ctx);
+    } else {
+        await ctx.reply('❌ Anda tidak memiliki akses admin.');
+    }
+});
+
+// Helper functions
+async function showMainMenu(ctx) {
+    const userId = ctx.from.id;
+    const user = await safeDBOperation(async () => await usersCollection.findOne({ userId }), { limit: 0 });
+    const limit = user ? user.limit : 0;
+    
+    await ctx.reply(`🤖 *Selamat Datang di Auto Order Bot*\n\n💼 Link Limit: *${limit}*`, {
+        parse_mode: 'Markdown',
+        reply_markup: Markup.inlineKeyboard([
+            [Markup.button.callback('🛒 Order', 'order')],
+            [Markup.button.callback('🔍 Cek Limit', 'check_limit')],
+            [Markup.button.callback('📊 Riwayat Order', 'view_history')],
+            [Markup.button.callback('🔑 Redeem Code', 'redeem_code')],
+            [Markup.button.url('💬 Hubungi Admin', 't.me/hiyaok')]
+        ])
+    });
+}
+
+async function showAdminMenu(ctx) {
+    await ctx.reply('👑 *Admin Panel*', {
+        parse_mode: 'Markdown',
+        reply_markup: Markup.inlineKeyboard([
+            [Markup.button.callback('➕ Add Code', 'add_code')],
+            [Markup.button.callback('📊 Cek Limit Users', 'check_all_limits')],
+            [Markup.button.callback('🔙 Menu User', 'back_to_user')]
+        ])
+    });
+}
+
+// Action handlers
+bot.action('add_code', async (ctx) => {
+    if (!config.adminId.includes(ctx.from.id.toString())) {
+        await ctx.answerCbQuery('❌ Anda tidak memiliki akses admin.');
         return;
     }
     
-    let message = '📜 *Riwayat Order* 📜\n\nOrder terakhir lu:\n\n';
-    
-    const buttons = [];
-    
-    for (const order of orders) {
-        const date = new Date(order.createdAt).toLocaleString();
-        message += `ID Order: ${order._id}\n`;
-        message += `Tanggal: ${date}\n`;
-        message += `Jumlah Link: ${order.links.length}\n`;
-        message += `Status: ${order.status}\n\n`;
-        
-        buttons.push([Markup.button.callback(`📊 Cek Status: ${order._id.toString().slice(-5)}`, `check_status_${order._id}`)]);
-    }
-    
-    buttons.push([Markup.button.callback('🔙 Balik ke Menu User', 'user_menu')]);
-    
-    // If there are too many orders, offer to download as a file
-    if (orders.length > 5) {
-        message += '\nBuat liat semua riwayat order, lu bisa download sebagai file:';
-        buttons.unshift([Markup.button.callback('📥 Download Riwayat Lengkap', 'download_history')]);
-    }
-    
-    await ctx.editMessageText(message, {
-        parse_mode: 'Markdown',
-        ...Markup.inlineKeyboard(buttons)
-    });
+    await ctx.scene.enter('addCode');
+    await ctx.answerCbQuery();
 });
 
-// Download full order history
-bot.action('download_history', async (ctx) => {
-    const user = await getUser(ctx);
-    
-    const orders = await Order.find({ userId: user.userId }).sort('-createdAt');
-    
-    if (orders.length === 0) {
-        return await ctx.answerCbQuery('Lu belum punya order buat didownload.');
+bot.action('check_all_limits', async (ctx) => {
+    if (!config.adminId.includes(ctx.from.id.toString())) {
+        await ctx.answerCbQuery('❌ Anda tidak memiliki akses admin.');
+        return;
     }
-    
-    let fileContent = 'ID Order,Tanggal,Link,Status,ID Order API\n';
-    
-    for (const order of orders) {
-        const date = new Date(order.createdAt).toISOString();
-        fileContent += `${order._id},${date},${order.links.length},${order.status},"${order.orderIds.join(', ')}"\n`;
-    }
-    
-    // Write to a temporary file
-    const fileName = `riwayat_order_${user.userId}.csv`;
-    fs.writeFileSync(fileName, fileContent);
-    
-    // Send the file
-    await ctx.replyWithDocument({
-        source: fileName,
-        filename: fileName
-    }, {
-        caption: '📊 Nih riwayat order lengkap lu'
-    });
-    
-    // Delete the file after sending
-    fs.unlinkSync(fileName);
-    
-    // Answer callback query
-    await ctx.answerCbQuery('Riwayat order lu udah dikirim sebagai file.');
-});
-
-// Check order status
-bot.action(/check_status_(.+)/, async (ctx) => {
-    const orderId = ctx.match[1];
     
     try {
-        const order = await Order.findById(orderId);
+        const users = await usersCollection.find().toArray();
         
-        if (!order) {
-            return await ctx.answerCbQuery('Order ga ketemu.');
+        if (users.length === 0) {
+            await ctx.editMessageText('❌ Belum ada user terdaftar.', {
+                reply_markup: Markup.inlineKeyboard([
+                    [Markup.button.callback('🔙 Kembali', 'back_to_admin')]
+                ])
+            });
+            return;
         }
         
-        // Check if this order belongs to the user
-        if (order.userId !== ctx.from.id.toString()) {
-            return await ctx.answerCbQuery('Lu ga punya akses buat liat order ini.');
-        }
+        let message = '👥 *Daftar Limit User*\n\n';
         
-        let message = `📊 *Status Order* 📊\n\n`;
-        message += `ID Order: ${order._id}\n`;
-        message += `Tanggal: ${new Date(order.createdAt).toLocaleString()}\n`;
-        message += `Jumlah Link: ${order.links.length}\n\n`;
-        
-        // Check status of each order ID
-        let statuses = [];
-        
-        for (let i = 0; i < Math.min(order.orderIds.length, 5); i++) {
-            const status = await checkOrderStatus(order.orderIds[i]);
-            
-            if (status) {
-                statuses.push(`Order ${i+1}: ${status.status}\n` +
-                             `Start Count: ${status.start_count}\n` +
-                             `Remains: ${status.remains}\n`);
-            } else {
-                statuses.push(`Order ${i+1}: Status ga tersedia\n`);
-            }
-        }
-        
-        if (statuses.length > 0) {
-            message += `*Status Detail:*\n\n${statuses.join('\n')}`;
-        } else {
-            message += `*Status:* ${order.status}\n`;
-        }
-        
-        // If there are too many order IDs, show a note
-        if (order.orderIds.length > 5) {
-            message += `\nCatatan: Cuma nunjukin 5 dari ${order.orderIds.length} order pertama aja.\n`;
+        for (const user of users) {
+            const username = user.username ? `@${user.username}` : `${user.firstName} ${user.lastName || ''}`;
+            message += `👤 ${username}\n`;
+            message += `🆔 ${user.userId}\n`;
+            message += `🔢 Limit: ${user.limit}\n\n`;
         }
         
         await ctx.editMessageText(message, {
             parse_mode: 'Markdown',
-            ...Markup.inlineKeyboard([
-                [Markup.button.callback('🔄 Refresh Status', `refresh_status_${orderId}`)],
-                [Markup.button.callback('🔙 Balik ke Riwayat Order', 'order_history')]
+            reply_markup: Markup.inlineKeyboard([
+                [Markup.button.callback('🔙 Kembali', 'back_to_admin')]
             ])
         });
     } catch (error) {
-        console.error('Error pas cek status order:', error);
-        await ctx.answerCbQuery('Error pas cek status order.');
+        console.error('Error checking all limits:', error);
+        await ctx.editMessageText('❌ Terjadi kesalahan saat mengambil data limit.', {
+            reply_markup: Markup.inlineKeyboard([
+                [Markup.button.callback('🔙 Kembali', 'back_to_admin')]
+            ])
+        });
     }
+    
+    await ctx.answerCbQuery();
 });
 
-// Refresh order status
-bot.action(/refresh_status_(.+)/, async (ctx) => {
-    const orderId = ctx.match[1];
-    
-    // Just call the check status action again
-    await ctx.answerCbQuery('Lagi refresh status...');
-    return ctx.action(`check_status_${orderId}`);
-});
-
-// Redeem code
-bot.action('redeem_code', async (ctx) => {
-    ctx.session = {
-        ...ctx.session,
-        redeemState: 'awaiting_file'
-    };
-    
-    await ctx.editMessageText('🎁 *Redeem Code* 🎁\n\nKirim file code yang lu punya.', {
+bot.action('back_to_admin', async (ctx) => {
+    await ctx.editMessageText('👑 *Admin Panel*', {
         parse_mode: 'Markdown',
-        ...Markup.inlineKeyboard([
-            [Markup.button.callback('❌ Batal', 'cancel_redeem')]
+        reply_markup: Markup.inlineKeyboard([
+            [Markup.button.callback('➕ Add Code', 'add_code')],
+            [Markup.button.callback('📊 Cek Limit Users', 'check_all_limits')],
+            [Markup.button.callback('🔙 Menu User', 'back_to_user')]
         ])
     });
+    await ctx.answerCbQuery();
 });
 
-bot.action('cancel_redeem', async (ctx) => {
-    delete ctx.session.redeemState;
+bot.action('back_to_user', async (ctx) => {
+    await showMainMenu(ctx);
+    await ctx.answerCbQuery();
+});
+
+bot.action('order', async (ctx) => {
+    const userId = ctx.from.id;
+    const user = await safeDBOperation(async () => await usersCollection.findOne({ userId }), { limit: 0 });
     
-    await ctx.editMessageText('🚫 Redeem dibatalin.', {
-        ...Markup.inlineKeyboard([
-            [Markup.button.callback('🔙 Balik ke Menu User', 'user_menu')]
-        ])
-    });
-});
-
-// Handle file for redeem
-bot.on('document', async (ctx) => {
-    if (!ctx.session || ctx.session.redeemState !== 'awaiting_file') {
+    if (!user || user.limit <= 0) {
+        await ctx.answerCbQuery('❌ Limit tidak mencukupi');
+        await ctx.editMessageText('❌ Limit tidak mencukupi untuk melakukan order.', {
+            reply_markup: Markup.inlineKeyboard([
+                [Markup.button.url('💬 Hubungi Admin', 't.me/hiyaok')],
+                [Markup.button.callback('🔙 Kembali', 'back_to_menu')]
+            ])
+        });
         return;
     }
     
-    const user = await getUser(ctx);
-    const fileId = ctx.message.document.file_id;
-    
-    // Download the file
-    const fileInfo = await ctx.telegram.getFile(fileId);
-    const fileUrl = `https://api.telegram.org/file/bot${config.botToken}/${fileInfo.file_path}`;
-    
-    try {
-        // Download the file content
-        const response = await axios.get(fileUrl, { responseType: 'arraybuffer' });
-        const tempFileName = `temp_${Date.now()}.json`;
-        fs.writeFileSync(tempFileName, response.data);
-        
-        // Verify the file
-        const codeData = verifyCodeFile(tempFileName);
-        
-        // Delete the temp file
-        fs.unlinkSync(tempFileName);
-        
-        if (!codeData || !codeData.code || !codeData.limit) {
-            await ctx.reply('❌ *File Code Ga Valid*\n\nFile yang lu kirim bukan file code yang valid.', {
-                parse_mode: 'Markdown',
-                ...Markup.inlineKeyboard([
-                    [Markup.button.callback('🔙 Balik ke Menu User', 'user_menu')]
-                ])
-            });
-            return;
-        }
-        
-        // Check if the code exists in the database
-        const code = await Code.findOne({ code: codeData.code });
-        
-        if (!code) {
-            await ctx.reply('❌ *Code Ga Ditemukan*\n\nCode dalam file ga ada di database kita.', {
-                parse_mode: 'Markdown',
-                ...Markup.inlineKeyboard([
-                    [Markup.button.callback('🔙 Balik ke Menu User', 'user_menu')]
-                ])
-            });
-            return;
-        }
-        
-        if (code.used) {
-            await ctx.reply('❌ *Code Udah Dipakai*\n\nCode ini udah pernah dipake sebelumnya.', {
-                parse_mode: 'Markdown',
-                ...Markup.inlineKeyboard([
-                    [Markup.button.callback('🔙 Balik ke Menu User', 'user_menu')]
-                ])
-            });
-            return;
-        }
-        
-        // Mark the code as used
-        code.used = true;
-        code.usedBy = user.userId;
-        code.usedAt = new Date();
-        await code.save();
-        
-        // Add limit to user
-        user.limit += code.limit;
-        await user.save();
-        
-        // Delete user's message to keep the chat clean
-        await ctx.deleteMessage(ctx.message.message_id);
-        
-        await ctx.reply(`✅ *Redeem Berhasil* ✅\n\nLu berhasil redeem ${code.limit} limit!\nLimit lu sekarang: ${user.limit}`, {
-            parse_mode: 'Markdown',
-            ...Markup.inlineKeyboard([
-                [Markup.button.callback('🏠 Balik ke Menu Utama', 'back_to_main')]
-            ])
-        });
-        
-        // Clear session data
-        delete ctx.session.redeemState;
-    } catch (error) {
-        console.error('Error redeem code:', error);
-        await ctx.reply('❌ *Error Redeem Code*\n\nTerjadi error pas proses redeem code. Coba lagi nanti.', {
-            parse_mode: 'Markdown',
-            ...Markup.inlineKeyboard([
-                [Markup.button.callback('🔙 Balik ke Menu User', 'user_menu')]
-            ])
-        });
-    }
+    await ctx.scene.enter('order');
+    await ctx.answerCbQuery();
 });
 
-// Help command
-bot.help(async (ctx) => {
-    const helpMessage = `🔍 *Bantuan Bot Auto Order* 🔍\n
-*Perintah yang tersedia:*
-/start - Mulai bot & liat menu utama
-/help - Tampilkan bantuan ini
-
-*Fitur User:*
-• Order - Pesan viewers & upvotes untuk link Quora
-• Cek Limit - Cek sisa limit lu
-• Riwayat Order - Liat riwayat & status order
-• Redeem Code - Tuker code jadi limit
-
-*Fitur Admin:*
-• Tambah Code - Bikin code redeem baru
-• Cek Limit User - Liat limit semua user
-
-Butuh bantuan? Kontak admin: @hiyaok`;
-
-    await ctx.reply(helpMessage, {
+bot.action('check_limit', async (ctx) => {
+    const userId = ctx.from.id;
+    const user = await safeDBOperation(async () => await usersCollection.findOne({ userId }), { limit: 0 });
+    const limit = user ? user.limit : 0;
+    
+    await ctx.editMessageText(`💼 *Info Limit*\n\n🔢 Link Limit Anda: *${limit}*`, {
         parse_mode: 'Markdown',
-        ...Markup.inlineKeyboard([
-            [Markup.button.callback('🏠 Ke Menu Utama', 'back_to_main')]
+        reply_markup: Markup.inlineKeyboard([
+            [Markup.button.callback('🔙 Kembali', 'back_to_menu')]
         ])
     });
+    await ctx.answerCbQuery();
 });
 
-// Handle unknown commands
-bot.on('text', async (ctx) => {
-    // Only respond if no other handler has processed the message
-    // and no session state is active
-    if (!ctx.session || (!ctx.session.orderState && !ctx.session.redeemState)) {
-        await ctx.reply('❓ Gua ga ngerti perintah lu nih. Coba pake /start atau /help buat liat menu.', {
-            ...Markup.inlineKeyboard([
-                [Markup.button.callback('🏠 Ke Menu Utama', 'back_to_main')]
+bot.action('view_history', async (ctx) => {
+    const userId = ctx.from.id;
+    const orders = await safeDBOperation(async () => {
+        return await ordersCollection.find({ userId }).sort({ createdAt: -1 }).limit(20).toArray();
+    }, []);
+    
+    if (orders.length === 0) {
+        await ctx.editMessageText('❌ Belum ada riwayat order.', {
+            reply_markup: Markup.inlineKeyboard([
+                [Markup.button.callback('🔙 Kembali', 'back_to_menu')]
+            ])
+        });
+        await ctx.answerCbQuery();
+        return;
+    }
+    
+    if (orders.length > 10) {
+        // Generate file for many orders
+        let fileContent = '📊 RIWAYAT ORDER\n\n';
+        
+        for (const order of orders) {
+            const date = new Date(order.createdAt).toLocaleString();
+            fileContent += `🆔 Order ID: ${order._id}\n`;
+            fileContent += `📅 Tanggal: ${date}\n`;
+            fileContent += `🔗 Link: ${order.link}\n`;
+            fileContent += `📊 Status: ${order.status}\n\n`;
+        }
+        
+        const fileName = `history_${userId}.txt`;
+        fs.writeFileSync(fileName, fileContent);
+        
+        await ctx.deleteMessage();
+        await ctx.replyWithDocument({ source: fileName }, {
+            caption: '📊 Riwayat order Anda',
+            reply_markup: Markup.inlineKeyboard([
+                [Markup.button.callback('🔙 Kembali ke Menu', 'back_to_menu')]
+            ])
+        });
+        
+        fs.unlinkSync(fileName);
+    } else {
+        // Show inline buttons for each order
+        let message = '📊 *Riwayat Order*\n\n';
+        const buttons = [];
+        
+        for (const order of orders) {
+            const date = new Date(order.createdAt).toLocaleString();
+            message += `🆔 Order ID: \`${order._id}\`\n`;
+            message += `📅 Tanggal: ${date}\n`;
+            message += `📊 Status: ${order.status}\n\n`;
+            
+            buttons.push([Markup.button.callback(`🔍 Cek Order ${order._id}`, `check_order_${order._id}`)]);
+        }
+        
+        buttons.push([Markup.button.callback('🔙 Kembali', 'back_to_menu')]);
+        
+        await ctx.editMessageText(message, {
+            parse_mode: 'Markdown',
+            reply_markup: Markup.inlineKeyboard(buttons)
+        });
+    }
+    
+    await ctx.answerCbQuery();
+});
+
+// Handle check_order callbacks
+bot.action(/check_order_(.+)/, async (ctx) => {
+    const orderId = ctx.match[1];
+    
+    try {
+        const order = await ordersCollection.findOne({ _id: orderId });
+        
+        if (!order) {
+            await ctx.answerCbQuery('❌ Order tidak ditemukan');
+            return;
+        }
+        
+        // Check status for first order
+        const firstStatusResponse = await axios.post(config.apiUrl, {
+            api_key: config.apiKey,
+            action: 'status',
+            secret_key: config.secretKey,
+            id: order.firstOrderId
+        });
+        
+        // Check status for second order
+        const secondStatusResponse = await axios.post(config.apiUrl, {
+            api_key: config.apiKey,
+            action: 'status',
+            secret_key: config.secretKey,
+            id: order.secondOrderId
+        });
+        
+        if (!firstStatusResponse.data.status || !secondStatusResponse.data.status) {
+            throw new Error('Gagal mendapatkan status order');
+        }
+        
+        const firstStatus = firstStatusResponse.data.data.status;
+        const secondStatus = secondStatusResponse.data.data.status;
+        
+        // Update order status in database
+        await ordersCollection.updateOne(
+            { _id: orderId },
+            { $set: { 
+                status: firstStatus,
+                firstStatus,
+                secondStatus,
+                lastChecked: new Date()
+            }}
+        );
+        
+        let message = `📊 *Detail Order ${orderId}*\n\n`;
+        message += `🔗 Link: ${order.link}\n\n`;
+        message += `📊 Status API 1: ${firstStatus}\n`;
+        message += `🔢 Start Count API 1: ${firstStatusResponse.data.data.start_count}\n`;
+        message += `📉 Remains API 1: ${firstStatusResponse.data.data.remains}\n\n`;
+        message += `📊 Status API 2: ${secondStatus}\n`;
+        message += `🔢 Start Count API 2: ${secondStatusResponse.data.data.start_count}\n`;
+        message += `📉 Remains API 2: ${secondStatusResponse.data.data.remains}\n\n`;
+        message += `📅 Last Updated: ${new Date().toLocaleString()}`;
+        
+        await ctx.editMessageText(message, {
+            parse_mode: 'Markdown',
+            reply_markup: Markup.inlineKeyboard([
+                [Markup.button.callback('🔄 Refresh', `check_order_${orderId}`)],
+                [Markup.button.callback('🔙 Kembali ke Riwayat', 'view_history')]
+            ])
+        });
+    } catch (error) {
+        console.error('Error checking order status:', error);
+        await ctx.editMessageText(`❌ Terjadi kesalahan saat mengecek status order: ${error.message}`, {
+            reply_markup: Markup.inlineKeyboard([
+                [Markup.button.callback('🔙 Kembali ke Riwayat', 'view_history')]
             ])
         });
     }
+    
+    await ctx.answerCbQuery();
 });
 
-// Error handling
-bot.catch((err, ctx) => {
-    console.error('Bot error:', err);
-    ctx.reply('❌ Waduh, error nih! Coba lagi nanti atau kontak admin: @hiyaok');
+bot.action('redeem_code', async (ctx) => {
+    await ctx.scene.enter('redeemCode');
+    await ctx.answerCbQuery();
+});
+
+bot.action('back_to_menu', async (ctx) => {
+    await showMainMenu(ctx);
+    await ctx.answerCbQuery();
 });
 
 // Start the bot
-bot.launch().then(() => {
-    console.log('Bot berhasil dijalankan!');
-}).catch(err => {
-    console.error('Error saat menjalankan bot:', err);
-});
+async function startBot() {
+    await connectToMongoDB();
+    
+    // Configure session middleware for concurrent user support
+    bot.use((ctx, next) => {
+        // Ensure each user has their own session context
+        ctx.session = ctx.session || {};
+        return next();
+    });
+    
+    await bot.launch({
+        // Enable concurrent processing of updates
+        dropPendingUpdates: false,
+        allowedUpdates: ['message', 'callback_query', 'inline_query']
+    });
+    
+    console.log('Bot started with concurrent user support');
+    
+    // Notify admins that bot is online
+    for (const adminId of config.adminId) {
+        try {
+            await bot.telegram.sendMessage(adminId, 
+                '🤖 *Bot is now online!*\n\nReady to process orders from multiple users concurrently.', 
+                { parse_mode: 'Markdown' }
+            );
+        } catch (e) {
+            console.error(`Failed to notify admin ${adminId} about startup:`, e);
+        }
+    }
+}
+
+startBot().catch(console.error);
 
 // Enable graceful stop
 process.once('SIGINT', () => bot.stop('SIGINT'));
