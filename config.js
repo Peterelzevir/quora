@@ -1,6 +1,6 @@
 // config.js
 const config = {
-    telegramToken: "YOUR_TELEGRAM_BOT_TOKEN",
+    telegramToken: "7776609805:AAHnDN-jnhl-TkG0g6FR8b3LnB9B0GeSyNc",
     apiKey: "YOUR_BUZZER_PANEL_API_KEY",
     secretKey: "YOUR_BUZZER_PANEL_SECRET_KEY",
     apiUrl: "https://buzzerpanel.id/api/json.php",
