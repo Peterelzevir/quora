@@ -1,825 +1,1358 @@
-// index.js
-const { Telegraf, Markup, Scenes, session } = require('telegraf');
-const { MongoClient } = require('mongodb');
-const axios = require('axios');
+// index.js - Main bot file
+const { Telegraf, Scenes, session } = require('telegraf');
+const mongoose = require('mongoose');
 const fs = require('fs');
 const crypto = require('crypto');
+const axios = require('axios');
 const config = require('./config');
+const { User, Order, RedeemCode } = require('./models');
 
 // Initialize bot
-const bot = new Telegraf(config.telegramToken);
-
-// Global error handler to prevent bot crashes
-process.on('uncaughtException', (error) => {
-    console.error('Uncaught Exception:', error);
-    
-    // Notify admins about error
-    for (const adminId of config.adminId) {
-        try {
-            bot.telegram.sendMessage(adminId, 
-                `⚠️ *Bot Error Alert*\n\nUncaught exception: ${error.message}\n\nBot is still running.`, 
-                { parse_mode: 'Markdown' }
-            );
-        } catch (e) {
-            console.error(`Failed to notify admin about error:`, e);
-        }
-    }
-});
-
-process.on('unhandledRejection', (reason, promise) => {
-    console.error('Unhandled Rejection at:', promise, 'reason:', reason);
-    
-    // Notify admins about rejection
-    for (const adminId of config.adminId) {
-        try {
-            bot.telegram.sendMessage(adminId, 
-                `⚠️ *Bot Error Alert*\n\nUnhandled promise rejection: ${reason}\n\nBot is still running.`, 
-                { parse_mode: 'Markdown' }
-            );
-        } catch (e) {
-            console.error(`Failed to notify admin about rejection:`, e);
-        }
-    }
-});
+const bot = new Telegraf(config.botToken);
 
 // Connect to MongoDB
-let db;
-let usersCollection;
-let codesCollection;
-let ordersCollection;
+mongoose.connect(config.mongoUri)
+  .then(() => console.log('Connected to MongoDB'))
+  .catch(err => {
+    console.error('MongoDB connection error:', err);
+    process.exit(1);
+  });
 
-async function connectToMongoDB() {
-    try {
-        const client = new MongoClient(config.mongoUri, { useNewUrlParser: true, useUnifiedTopology: true });
-        await client.connect();
-        console.log('Connected to MongoDB');
-        
-        db = client.db('orderBot');
-        usersCollection = db.collection('users');
-        codesCollection = db.collection('codes');
-        ordersCollection = db.collection('orders');
-        
-        // Create indexes
-        await usersCollection.createIndex({ userId: 1 }, { unique: true });
-        await codesCollection.createIndex({ code: 1 }, { unique: true });
-        await ordersCollection.createIndex({ orderId: 1 }, { unique: true });
-    } catch (error) {
-        console.error('Error connecting to MongoDB:', error);
-        process.exit(1);
-    }
-}
-
-// Function for safe DB operations
-async function safeDBOperation(operation, fallback = null) {
-    try {
-        return await operation();
-    } catch (error) {
-        console.error('Database operation error:', error);
-        return fallback;
-    }
-}
-
-// Scene for adding codes
-const addCodeScene = new Scenes.BaseScene('addCode');
-
-addCodeScene.enter(async (ctx) => {
-    await ctx.reply('🔑 Masukkan jumlah limit yang ingin dibuat:', {
-        reply_markup: { remove_keyboard: true }
-    });
-});
-
-addCodeScene.on('text', async (ctx) => {
-    const amount = parseInt(ctx.message.text.trim());
-    
-    if (isNaN(amount) || amount <= 0) {
-        await ctx.reply('❌ Jumlah tidak valid. Silakan masukkan angka positif.');
-        return;
-    }
-    
-    try {
-        // Generate unique code
-        const code = crypto.randomBytes(8).toString('hex');
-        
-        // Create the redemption code in database
-        await codesCollection.insertOne({
-            code,
-            amount,
-            createdBy: ctx.from.id,
-            createdAt: new Date(),
-            isRedeemed: false
-        });
-        
-        // Create code file
-        const codeData = {
-            code,
-            amount,
-            createdAt: new Date().toISOString()
-        };
-        
-        const fileName = `code_${code}.json`;
-        fs.writeFileSync(fileName, JSON.stringify(codeData, null, 2));
-        
-        // Send the file to admin
-        await ctx.replyWithDocument({ source: fileName }, {
-            caption: `✅ Code berhasil dibuat!\n\n🔑 Code: ${code}\n🔢 Jumlah Limit: ${amount}`
-        });
-        
-        // Delete the file after sending
-        fs.unlinkSync(fileName);
-        
-        // Exit the scene
-        await ctx.scene.leave();
-        await showAdminMenu(ctx);
-    } catch (error) {
-        console.error('Error generating code:', error);
-        await ctx.reply('❌ Terjadi kesalahan saat membuat code.');
-        await ctx.scene.leave();
-        await showAdminMenu(ctx);
-    }
-});
-
-// Scene for processing orders
-const orderScene = new Scenes.BaseScene('order');
-
-orderScene.enter(async (ctx) => {
-    await ctx.reply('📋 Silakan kirimkan link yang ingin diproses (satu atau lebih, tiap link di baris baru):', {
-        reply_markup: { remove_keyboard: true }
-    });
-});
-
-orderScene.on('text', async (ctx) => {
-    const links = ctx.message.text.trim().split('\n').filter(link => link.trim().startsWith('http'));
-    
-    if (links.length === 0) {
-        await ctx.reply('❌ Tidak ada link valid yang ditemukan. Link harus dimulai dengan http atau https.');
-        return;
-    }
-    
-    const userId = ctx.from.id;
-    const user = await usersCollection.findOne({ userId });
-    
-    if (!user || user.limit < links.length) {
-        await ctx.reply(`❌ Limit tidak mencukupi. Anda membutuhkan ${links.length} limit, tetapi hanya memiliki ${user ? user.limit : 0} limit.`, {
-            reply_markup: Markup.inlineKeyboard([
-                Markup.button.url('💬 Hubungi Admin', 't.me/hiyaok')
-            ])
-        });
-        await ctx.scene.leave();
-        return;
-    }
-    
-    ctx.session.links = links;
-    ctx.session.totalLinks = links.length;
-    
-    await ctx.reply(`📝 Ditemukan ${links.length} link. Anda memiliki ${user.limit} limit.`, {
-        reply_markup: Markup.inlineKeyboard([
-            [Markup.button.callback('✅ Order', 'confirm_order')],
-            [Markup.button.callback('❌ Batalkan', 'cancel_order')]
-        ])
-    });
-});
-
-orderScene.action('confirm_order', async (ctx) => {
-    await ctx.editMessageText('🔄 Apakah Anda yakin ingin melanjutkan order? Setelah dikonfirmasi, order tidak dapat dibatalkan.', {
-        reply_markup: Markup.inlineKeyboard([
-            [Markup.button.callback('✅ 100% Yakin', 'process_order')],
-            [Markup.button.callback('❌ Batalkan', 'cancel_order')]
-        ])
-    });
-});
-
-orderScene.action('process_order', async (ctx) => {
-    try {
-        await ctx.editMessageText('🔄 Memproses order...');
-        
-        const userId = ctx.from.id;
-        const username = ctx.from.username ? `@${ctx.from.username}` : ctx.from.first_name;
-        const { links } = ctx.session;
-        
-        // Notify admin about new order
-        for (const adminId of config.adminId) {
-            try {
-                await bot.telegram.sendMessage(adminId, 
-                    `🛒 *Order Baru!*\n\n👤 User: ${username}\n🆔 ID: \`${userId}\`\n🔢 Jumlah Link: ${links.length}`, 
-                    { parse_mode: 'Markdown' }
-                );
-            } catch (e) {
-                console.error(`Failed to notify admin ${adminId}:`, e);
-            }
-        }
-        
-        // Get services first
-        const servicesResponse = await axios.post(config.apiUrl, {
-            api_key: config.apiKey,
-            action: 'services',
-            secret_key: config.secretKey
-        });
-        
-        if (!servicesResponse.data.status) {
-            throw new Error('Gagal mendapatkan layanan dari API');
-        }
-        
-        // Validate service IDs exist and check prices
-        const services = servicesResponse.data.data;
-        const firstService = services.find(s => s.id.toString() === config.serviceIds.first);
-        const secondService = services.find(s => s.id.toString() === config.serviceIds.second);
-        
-        if (!firstService || !secondService) {
-            throw new Error('Service ID tidak ditemukan');
-        }
-        
-        if (firstService.price > 10000) {
-            throw new Error(`Service ID ${config.serviceIds.first} melebihi harga maksimal 10.000`);
-        }
-        
-        if (secondService.price > 150000) {
-            throw new Error(`Service ID ${config.serviceIds.second} melebihi harga maksimal 150.000`);
-        }
-        
-        // Process each link
-        const orderResults = [];
-        for (const [index, link] of links.entries()) {
-            await ctx.editMessageText(`🔄 Memproses link ${index + 1} dari ${links.length}...`);
-            
-            // First API order
-            const firstOrderResponse = await axios.post(config.apiUrl, {
-                api_key: config.apiKey,
-                action: 'order',
-                secret_key: config.secretKey,
-                service: config.serviceIds.first,
-                data: link,
-                quantity: config.quantities.first
-            });
-            
-            if (!firstOrderResponse.data.status) {
-                throw new Error(`Gagal order API pertama untuk link ${index + 1}: ${firstOrderResponse.data.message || 'Unknown error'}`);
-            }
-            
-            // Second API order
-            const secondOrderResponse = await axios.post(config.apiUrl, {
-                api_key: config.apiKey,
-                action: 'order',
-                secret_key: config.secretKey,
-                service: config.serviceIds.second,
-                data: link,
-                quantity: config.quantities.second
-            });
-            
-            if (!secondOrderResponse.data.status) {
-                throw new Error(`Gagal order API kedua untuk link ${index + 1}: ${secondOrderResponse.data.message || 'Unknown error'}`);
-            }
-            
-            // Save order info
-            const orderInfo = {
-                userId,
-                link,
-                firstOrderId: firstOrderResponse.data.data.id,
-                secondOrderId: secondOrderResponse.data.data.id,
-                status: 'Pending',
-                createdAt: new Date()
-            };
-            
-            const result = await ordersCollection.insertOne(orderInfo);
-            orderResults.push({
-                orderId: result.insertedId,
-                firstOrderId: firstOrderResponse.data.data.id,
-                secondOrderId: secondOrderResponse.data.data.id
-            });
-        }
-        
-        // Update user's limit
-        await usersCollection.updateOne(
-            { userId },
-            { $inc: { limit: -links.length } }
-        );
-        
-        // Generate success message
-        let successMessage = `✅ Order berhasil diproses!\n\n`;
-        successMessage += `📊 Detail Order:\n`;
-        successMessage += `📌 Jumlah Link: ${links.length}\n`;
-        successMessage += `🔢 Limit Terpakai: ${links.length}\n\n`;
-        
-        const user = await usersCollection.findOne({ userId });
-        successMessage += `🔄 Sisa Limit: ${user.limit}`;
-        
-        await ctx.editMessageText(successMessage, {
-            reply_markup: Markup.inlineKeyboard([
-                [Markup.button.callback('📊 Riwayat Order', 'view_history')]
-            ])
-        });
-        
-        // Notify admin about successful order completion
-        for (const adminId of config.adminId) {
-            try {
-                const orderSummary = `✅ *Order Selesai Diproses!*\n\n👤 User: ${ctx.from.username ? `@${ctx.from.username}` : ctx.from.first_name}\n🆔 ID: \`${userId}\`\n🔢 Jumlah Link: ${links.length}\n🔗 Order IDs: ${orderResults.map(o => o.orderId).join(', ')}`;
-                
-                await bot.telegram.sendMessage(adminId, orderSummary, {
-                    parse_mode: 'Markdown'
-                });
-            } catch (e) {
-                console.error(`Failed to notify admin ${adminId} about completion:`, e);
-            }
-        }
-        
-        await ctx.scene.leave();
-    } catch (error) {
-        console.error('Error processing order:', error);
-        await ctx.editMessageText(`❌ Terjadi kesalahan: ${error.message}`, {
-            reply_markup: Markup.inlineKeyboard([
-                [Markup.button.callback('🔙 Kembali ke Menu', 'back_to_menu')]
-            ])
-        });
-        await ctx.scene.leave();
-    }
-});
-
-orderScene.action('cancel_order', async (ctx) => {
-    await ctx.editMessageText('❌ Order dibatalkan.');
-    await ctx.scene.leave();
-    await showMainMenu(ctx);
-});
-
-// Scene for code redemption
-const redeemCodeScene = new Scenes.BaseScene('redeemCode');
-
-redeemCodeScene.enter(async (ctx) => {
-    await ctx.reply('📤 Silakan kirim file code yang ingin di-redeem:', {
-        reply_markup: { remove_keyboard: true }
-    });
-});
-
-redeemCodeScene.on('document', async (ctx) => {
-    try {
-        const fileId = ctx.message.document.file_id;
-        const fileInfo = await ctx.telegram.getFile(fileId);
-        const fileUrl = `https://api.telegram.org/file/bot${config.telegramToken}/${fileInfo.file_path}`;
-        
-        const response = await axios.get(fileUrl);
-        const codeData = response.data;
-        
-        if (!codeData || !codeData.code || !codeData.amount) {
-            await ctx.reply('❌ Format file tidak valid.');
-            await ctx.scene.leave();
-            await showMainMenu(ctx);
-            return;
-        }
-        
-        const code = codeData.code;
-        const codeDoc = await codesCollection.findOne({ code });
-        
-        if (!codeDoc) {
-            await ctx.reply('❌ Code tidak ditemukan.');
-            await ctx.scene.leave();
-            await showMainMenu(ctx);
-            return;
-        }
-        
-        if (codeDoc.isRedeemed) {
-            await ctx.reply('❌ Code sudah digunakan.');
-            await ctx.scene.leave();
-            await showMainMenu(ctx);
-            return;
-        }
-        
-        // Update code status
-        await codesCollection.updateOne(
-            { code },
-            { $set: { isRedeemed: true, redeemedBy: ctx.from.id, redeemedAt: new Date() } }
-        );
-        
-        // Update user's limit
-        const userId = ctx.from.id;
-        const user = await usersCollection.findOne({ userId });
-        
-        if (user) {
-            await usersCollection.updateOne(
-                { userId },
-                { $inc: { limit: codeDoc.amount } }
-            );
-        } else {
-            await usersCollection.insertOne({
-                userId,
-                username: ctx.from.username || null,
-                firstName: ctx.from.first_name,
-                lastName: ctx.from.last_name || null,
-                limit: codeDoc.amount,
-                createdAt: new Date()
-            });
-        }
-        
-        const updatedUser = await usersCollection.findOne({ userId });
-        
-        await ctx.reply(`✅ Code berhasil di-redeem!\n\n🔢 Limit Ditambahkan: ${codeDoc.amount}\n🔄 Total Limit Sekarang: ${updatedUser.limit}`);
-        await ctx.scene.leave();
-        await showMainMenu(ctx);
-    } catch (error) {
-        console.error('Error redeeming code:', error);
-        await ctx.reply('❌ Terjadi kesalahan saat meredeem code.');
-        await ctx.scene.leave();
-        await showMainMenu(ctx);
-    }
-});
-
-// Create scene manager
-const stage = new Scenes.Stage([addCodeScene, orderScene, redeemCodeScene]);
-
-// Add middleware for handling concurrent processing
-bot.use(async (ctx, next) => {
-    try {
-        // Set a timeout for operations
-        const timeoutPromise = new Promise((_, reject) => {
-            setTimeout(() => reject(new Error('Operation timed out')), 30000); // 30 seconds timeout
-        });
-        
-        // Race the next middleware against the timeout
-        await Promise.race([next(), timeoutPromise]);
-    } catch (error) {
-        console.error('Error in middleware:', error);
-        
-        // Only notify user if the context is still valid
-        try {
-            if (ctx.callbackQuery) {
-                await ctx.answerCbQuery('Terjadi kesalahan, silakan coba lagi').catch(() => {});
-            }
-            
-            // Don't interrupt user flow if they're in a scene
-            if (!ctx.session?.currentScene) {
-                await ctx.reply('❌ Terjadi kesalahan saat memproses permintaan Anda. Silakan coba lagi.').catch(() => {});
-            }
-        } catch (replyError) {
-            console.error('Error replying to user:', replyError);
-        }
-    }
-});
-
-// Middleware
-bot.use(session());
-bot.use(stage.middleware());
-
-// Check if user exists and create if not
-bot.use(async (ctx, next) => {
-    if (ctx.from) {
-        const userId = ctx.from.id;
-        const user = await safeDBOperation(async () => {
-            const existingUser = await usersCollection.findOne({ userId });
-            
-            if (!existingUser) {
-                await usersCollection.insertOne({
-                    userId,
-                    username: ctx.from.username || null,
-                    firstName: ctx.from.first_name,
-                    lastName: ctx.from.last_name || null,
-                    limit: 0,
-                    createdAt: new Date()
-                });
-            }
-            
-            return existingUser || await usersCollection.findOne({ userId });
-        }, { limit: 0 });
-    }
-    return next();
-});
-
-// Command handlers
-bot.start(async (ctx) => {
-    const userId = ctx.from.id;
-    
-    if (config.adminId.includes(userId.toString())) {
-        await showAdminMenu(ctx);
-    } else {
-        await showMainMenu(ctx);
-    }
-});
-
-bot.command('admin', async (ctx) => {
-    const userId = ctx.from.id;
-    
-    if (config.adminId.includes(userId.toString())) {
-        await showAdminMenu(ctx);
-    } else {
-        await ctx.reply('❌ Anda tidak memiliki akses admin.');
-    }
-});
-
-// Helper functions
-async function showMainMenu(ctx) {
-    const userId = ctx.from.id;
-    const user = await safeDBOperation(async () => await usersCollection.findOne({ userId }), { limit: 0 });
-    const limit = user ? user.limit : 0;
-    
-    await ctx.reply(`🤖 *Selamat Datang di Auto Order Bot*\n\n💼 Link Limit: *${limit}*`, {
+// Handle code text input
+bot.on('text', async (ctx) => {
+  // Skip if not in redeem mode
+  if (ctx.session.redeemState !== 'waiting_for_code') {
+    return;
+  }
+  
+  await deletePrevMessage(ctx);
+  
+  const code = ctx.message.text.trim();
+  
+  // Delete user message with code
+  await ctx.deleteMessage(ctx.message.message_id);
+  
+  // Check if code exists
+  const redeemCode = await RedeemCode.findOne({ code });
+  
+  if (!redeemCode) {
+    const message = await ctx.reply(
+      `❌ *Invalid Code*\n\n` +
+      `The code you entered is not valid. Please check and try again.`,
+      {
         parse_mode: 'Markdown',
-        reply_markup: Markup.inlineKeyboard([
-            [Markup.button.callback('🛒 Order', 'order')],
-            [Markup.button.callback('🔍 Cek Limit', 'check_limit')],
-            [Markup.button.callback('📊 Riwayat Order', 'view_history')],
-            [Markup.button.callback('🔑 Redeem Code', 'redeem_code')],
-            [Markup.button.url('💬 Hubungi Admin', 't.me/hiyaok')]
-        ])
-    });
-}
-
-async function showAdminMenu(ctx) {
-    await ctx.reply('👑 *Admin Panel*', {
+        reply_markup: {
+          inline_keyboard: [
+            [{ text: '🔄 Try Again', callback_data: 'redeem_code' }],
+            [{ text: '🔙 Back to Menu', callback_data: 'user_menu' }]
+          ]
+        }
+      }
+    );
+    
+    ctx.session.lastBotMessageId = message.message_id;
+    return;
+  }
+  
+  // Check if code is already used
+  if (redeemCode.isUsed) {
+    const message = await ctx.reply(
+      `❌ *Code Already Used*\n\n` +
+      `This code has already been redeemed.`,
+      {
         parse_mode: 'Markdown',
-        reply_markup: Markup.inlineKeyboard([
-            [Markup.button.callback('➕ Add Code', 'add_code')],
-            [Markup.button.callback('📊 Cek Limit Users', 'check_all_limits')],
-            [Markup.button.callback('🔙 Menu User', 'back_to_user')]
-        ])
-    });
-}
-
-// Action handlers
-bot.action('add_code', async (ctx) => {
-    if (!config.adminId.includes(ctx.from.id.toString())) {
-        await ctx.answerCbQuery('❌ Anda tidak memiliki akses admin.');
-        return;
-    }
+        reply_markup: {
+          inline_keyboard: [
+            [{ text: '🔄 Try Again', callback_data: 'redeem_code' }],
+            [{ text: '🔙 Back to Menu', callback_data: 'user_menu' }]
+          ]
+        }
+      }
+    );
     
-    await ctx.scene.enter('addCode');
-    await ctx.answerCbQuery();
+    ctx.session.lastBotMessageId = message.message_id;
+    return;
+  }
+  
+  // Add link limit to user
+  const userId = ctx.from.id.toString();
+  const user = await User.findOne({ userId });
+  
+  user.linkLimit += redeemCode.amount;
+  await user.save();
+  
+  // Mark code as used
+  redeemCode.isUsed = true;
+  redeemCode.usedBy = userId;
+  redeemCode.usedAt = new Date();
+  await redeemCode.save();
+  
+  const message = await ctx.reply(
+    `✅ *Code Redeemed Successfully!*\n\n` +
+    `Added ${redeemCode.amount} links to your account.\n\n` +
+    `Your new link limit: ${user.linkLimit} links`,
+    {
+      parse_mode: 'Markdown',
+      reply_markup: {
+        inline_keyboard: [
+          [{ text: '🛒 Place an Order', callback_data: 'order' }],
+          [{ text: '🔙 Back to Menu', callback_data: 'user_menu' }]
+        ]
+      }
+    }
+  );
+  
+  ctx.session.lastBotMessageId = message.message_id;
 });
 
-bot.action('check_all_limits', async (ctx) => {
-    if (!config.adminId.includes(ctx.from.id.toString())) {
-        await ctx.answerCbQuery('❌ Anda tidak memiliki akses admin.');
-        return;
+// Handle file (document) for redeem code
+bot.on('document', async (ctx) => {
+  // Skip if not in redeem mode
+  if (ctx.session.redeemState !== 'waiting_for_code') {
+    return;
+  }
+  
+  await deletePrevMessage(ctx);
+  
+  // Get file link
+  const fileId = ctx.message.document.file_id;
+  const fileLink = await ctx.telegram.getFileLink(fileId);
+  
+  try {
+    // Download file
+    const response = await axios.get(fileLink.href);
+    const fileContent = response.data;
+    
+    // Extract code from file (assuming format contains "REDEEM CODE: XXXX")
+    const codeMatch = fileContent.match(/REDEEM CODE: ([a-zA-Z0-9]+)/);
+    
+    if (!codeMatch || !codeMatch[1]) {
+      const message = await ctx.reply(
+        `❌ *Invalid File Format*\n\n` +
+        `Could not find a valid redeem code in the file.`,
+        {
+          parse_mode: 'Markdown',
+          reply_markup: {
+            inline_keyboard: [
+              [{ text: '🔄 Try Again', callback_data: 'redeem_code' }],
+              [{ text: '🔙 Back to Menu', callback_data: 'user_menu' }]
+            ]
+          }
+        }
+      );
+      
+      ctx.session.lastBotMessageId = message.message_id;
+      return;
     }
     
-    try {
-        const users = await usersCollection.find().toArray();
-        
-        if (users.length === 0) {
-            await ctx.editMessageText('❌ Belum ada user terdaftar.', {
-                reply_markup: Markup.inlineKeyboard([
-                    [Markup.button.callback('🔙 Kembali', 'back_to_admin')]
-                ])
-            });
-            return;
+    const code = codeMatch[1];
+    
+    // Check if code exists
+    const redeemCode = await RedeemCode.findOne({ code });
+    
+    if (!redeemCode) {
+      const message = await ctx.reply(
+        `❌ *Invalid Code*\n\n` +
+        `The code in the file is not valid. Please check and try again.`,
+        {
+          parse_mode: 'Markdown',
+          reply_markup: {
+            inline_keyboard: [
+              [{ text: '🔄 Try Again', callback_data: 'redeem_code' }],
+              [{ text: '🔙 Back to Menu', callback_data: 'user_menu' }]
+            ]
+          }
         }
-        
-        let message = '👥 *Daftar Limit User*\n\n';
-        
-        for (const user of users) {
-            const username = user.username ? `@${user.username}` : `${user.firstName} ${user.lastName || ''}`;
-            message += `👤 ${username}\n`;
-            message += `🆔 ${user.userId}\n`;
-            message += `🔢 Limit: ${user.limit}\n\n`;
-        }
-        
-        await ctx.editMessageText(message, {
-            parse_mode: 'Markdown',
-            reply_markup: Markup.inlineKeyboard([
-                [Markup.button.callback('🔙 Kembali', 'back_to_admin')]
-            ])
-        });
-    } catch (error) {
-        console.error('Error checking all limits:', error);
-        await ctx.editMessageText('❌ Terjadi kesalahan saat mengambil data limit.', {
-            reply_markup: Markup.inlineKeyboard([
-                [Markup.button.callback('🔙 Kembali', 'back_to_admin')]
-            ])
-        });
+      );
+      
+      ctx.session.lastBotMessageId = message.message_id;
+      return;
     }
     
-    await ctx.answerCbQuery();
-});
-
-bot.action('back_to_admin', async (ctx) => {
-    await ctx.editMessageText('👑 *Admin Panel*', {
+    // Check if code is already used
+    if (redeemCode.isUsed) {
+      const message = await ctx.reply(
+        `❌ *Code Already Used*\n\n` +
+        `This code has already been redeemed.`,
+        {
+          parse_mode: 'Markdown',
+          reply_markup: {
+            inline_keyboard: [
+              [{ text: '🔄 Try Again', callback_data: 'redeem_code' }],
+              [{ text: '🔙 Back to Menu', callback_data: 'user_menu' }]
+            ]
+          }
+        }
+      );
+      
+      ctx.session.lastBotMessageId = message.message_id;
+      return;
+    }
+    
+    // Add link limit to user
+    const userId = ctx.from.id.toString();
+    const user = await User.findOne({ userId });
+    
+    user.linkLimit += redeemCode.amount;
+    await user.save();
+    
+    // Mark code as used
+    redeemCode.isUsed = true;
+    redeemCode.usedBy = userId;
+    redeemCode.usedAt = new Date();
+    await redeemCode.save();
+    
+    const message = await ctx.reply(
+      `✅ *Code Redeemed Successfully!*\n\n` +
+      `Added ${redeemCode.amount} links to your account.\n\n` +
+      `Your new link limit: ${user.linkLimit} links`,
+      {
         parse_mode: 'Markdown',
-        reply_markup: Markup.inlineKeyboard([
-            [Markup.button.callback('➕ Add Code', 'add_code')],
-            [Markup.button.callback('📊 Cek Limit Users', 'check_all_limits')],
-            [Markup.button.callback('🔙 Menu User', 'back_to_user')]
-        ])
-    });
-    await ctx.answerCbQuery();
-});
-
-bot.action('back_to_user', async (ctx) => {
-    await showMainMenu(ctx);
-    await ctx.answerCbQuery();
-});
-
-bot.action('order', async (ctx) => {
-    const userId = ctx.from.id;
-    const user = await safeDBOperation(async () => await usersCollection.findOne({ userId }), { limit: 0 });
+        reply_markup: {
+          inline_keyboard: [
+            [{ text: '🛒 Place an Order', callback_data: 'order' }],
+            [{ text: '🔙 Back to Menu', callback_data: 'user_menu' }]
+          ]
+        }
+      }
+    );
     
-    if (!user || user.limit <= 0) {
-        await ctx.answerCbQuery('❌ Limit tidak mencukupi');
-        await ctx.editMessageText('❌ Limit tidak mencukupi untuk melakukan order.', {
-            reply_markup: Markup.inlineKeyboard([
-                [Markup.button.url('💬 Hubungi Admin', 't.me/hiyaok')],
-                [Markup.button.callback('🔙 Kembali', 'back_to_menu')]
-            ])
-        });
-        return;
-    }
+    ctx.session.lastBotMessageId = message.message_id;
     
-    await ctx.scene.enter('order');
-    await ctx.answerCbQuery();
-});
-
-bot.action('check_limit', async (ctx) => {
-    const userId = ctx.from.id;
-    const user = await safeDBOperation(async () => await usersCollection.findOne({ userId }), { limit: 0 });
-    const limit = user ? user.limit : 0;
+  } catch (error) {
+    console.error('Error processing file:', error);
     
-    await ctx.editMessageText(`💼 *Info Limit*\n\n🔢 Link Limit Anda: *${limit}*`, {
+    const message = await ctx.reply(
+      `❌ *Error Processing File*\n\n` +
+      `Could not process the file. Please try again or enter the code manually.`,
+      {
         parse_mode: 'Markdown',
-        reply_markup: Markup.inlineKeyboard([
-            [Markup.button.callback('🔙 Kembali', 'back_to_menu')]
-        ])
+        reply_markup: {
+          inline_keyboard: [
+            [{ text: '🔄 Try Again', callback_data: 'redeem_code' }],
+            [{ text: '🔙 Back to Menu', callback_data: 'user_menu' }]
+          ]
+        }
+      }
+    );
+    
+    ctx.session.lastBotMessageId = message.message_id;
+  }
+});
+
+// Order History
+bot.action('order_history', async (ctx) => {
+  await ctx.answerCbQuery();
+  await deletePrevMessage(ctx);
+  
+  const userId = ctx.from.id.toString();
+  const orders = await Order.find({ userId }).sort({ createdAt: -1 }).limit(10);
+  
+  if (orders.length === 0) {
+    const message = await ctx.reply(
+      `*Order History* 📚\n\n` +
+      `You haven't placed any orders yet.`,
+      {
+        parse_mode: 'Markdown',
+        reply_markup: {
+          inline_keyboard: [
+            [{ text: '🛒 Place an Order', callback_data: 'order' }],
+            [{ text: '🔙 Back to Menu', callback_data: 'user_menu' }]
+          ]
+        }
+      }
+    );
+    
+    ctx.session.lastBotMessageId = message.message_id;
+    return;
+  }
+  
+  // Create history message
+  let historyMessage = `*Order History* 📚\n\n`;
+  historyMessage += `Your last ${orders.length} orders:\n\n`;
+  
+  // If too many orders, prepare a file
+  if (orders.length > 5) {
+    // Create a file with all orders
+    let fileContent = `Order History for ${ctx.from.username || ctx.from.first_name}\n`;
+    fileContent += `Generated on ${new Date().toLocaleString()}\n\n`;
+    
+    orders.forEach((order, index) => {
+      fileContent += `Order ${index + 1}:\n`;
+      fileContent += `Date: ${order.createdAt.toLocaleString()}\n`;
+      fileContent += `Link: ${order.link}\n`;
+      fileContent += `Status: ${order.status}\n`;
+      
+      if (order.followersOrderId) {
+        fileContent += `Followers Order ID: ${order.followersOrderId}\n`;
+      }
+      
+      if (order.likesOrderId) {
+        fileContent += `Likes Order ID: ${order.likesOrderId}\n`;
+      }
+      
+      fileContent += `\n`;
     });
-    await ctx.answerCbQuery();
+    
+    // Create file
+    const fileName = `order_history_${userId}.txt`;
+    fs.writeFileSync(fileName, fileContent);
+    
+    // Send file with inline buttons for each order
+    await ctx.replyWithDocument({ source: fileName }, {
+      caption: `Your complete order history is in this file.\nClick the buttons below to check specific order status:`,
+      reply_markup: {
+        inline_keyboard: [
+          ...orders.slice(0, 5).map((order, index) => [
+            { 
+              text: `Order #${index + 1} (${order.status})`, 
+              callback_data: `check_order_${order._id}` 
+            }
+          ]),
+          [{ text: '🔙 Back to Menu', callback_data: 'user_menu' }]
+        ]
+      }
+    });
+    
+    // Delete file
+    fs.unlinkSync(fileName);
+    
+  } else {
+    // Show orders directly in message
+    orders.forEach((order, index) => {
+      historyMessage += `*Order #${index + 1}*\n`;
+      historyMessage += `Date: ${order.createdAt.toLocaleString()}\n`;
+      historyMessage += `Link: ${order.link.substring(0, 30)}...\n`;
+      historyMessage += `Status: ${order.status}\n\n`;
+    });
+    
+    const message = await ctx.reply(
+      historyMessage,
+      {
+        parse_mode: 'Markdown',
+        reply_markup: {
+          inline_keyboard: [
+            ...orders.map((order, index) => [
+              { 
+                text: `Check Status #${index + 1}`, 
+                callback_data: `check_order_${order._id}` 
+              }
+            ]),
+            [{ text: '🔙 Back to Menu', callback_data: 'user_menu' }]
+          ]
+        }
+      }
+    );
+    
+    ctx.session.lastBotMessageId = message.message_id;
+  }
 });
 
-bot.action('view_history', async (ctx) => {
-    const userId = ctx.from.id;
-    const orders = await safeDBOperation(async () => {
-        return await ordersCollection.find({ userId }).sort({ createdAt: -1 }).limit(20).toArray();
-    }, []);
-    
-    if (orders.length === 0) {
-        await ctx.editMessageText('❌ Belum ada riwayat order.', {
-            reply_markup: Markup.inlineKeyboard([
-                [Markup.button.callback('🔙 Kembali', 'back_to_menu')]
-            ])
-        });
-        await ctx.answerCbQuery();
-        return;
-    }
-    
-    if (orders.length > 10) {
-        // Generate file for many orders
-        let fileContent = '📊 RIWAYAT ORDER\n\n';
-        
-        for (const order of orders) {
-            const date = new Date(order.createdAt).toLocaleString();
-            fileContent += `🆔 Order ID: ${order._id}\n`;
-            fileContent += `📅 Tanggal: ${date}\n`;
-            fileContent += `🔗 Link: ${order.link}\n`;
-            fileContent += `📊 Status: ${order.status}\n\n`;
-        }
-        
-        const fileName = `history_${userId}.txt`;
-        fs.writeFileSync(fileName, fileContent);
-        
-        await ctx.deleteMessage();
-        await ctx.replyWithDocument({ source: fileName }, {
-            caption: '📊 Riwayat order Anda',
-            reply_markup: Markup.inlineKeyboard([
-                [Markup.button.callback('🔙 Kembali ke Menu', 'back_to_menu')]
-            ])
-        });
-        
-        fs.unlinkSync(fileName);
-    } else {
-        // Show inline buttons for each order
-        let message = '📊 *Riwayat Order*\n\n';
-        const buttons = [];
-        
-        for (const order of orders) {
-            const date = new Date(order.createdAt).toLocaleString();
-            message += `🆔 Order ID: \`${order._id}\`\n`;
-            message += `📅 Tanggal: ${date}\n`;
-            message += `📊 Status: ${order.status}\n\n`;
-            
-            buttons.push([Markup.button.callback(`🔍 Cek Order ${order._id}`, `check_order_${order._id}`)]);
-        }
-        
-        buttons.push([Markup.button.callback('🔙 Kembali', 'back_to_menu')]);
-        
-        await ctx.editMessageText(message, {
-            parse_mode: 'Markdown',
-            reply_markup: Markup.inlineKeyboard(buttons)
-        });
-    }
-    
-    await ctx.answerCbQuery();
-});
-
-// Handle check_order callbacks
+// Check specific order status
 bot.action(/check_order_(.+)/, async (ctx) => {
-    const orderId = ctx.match[1];
+  await ctx.answerCbQuery();
+  await deletePrevMessage(ctx);
+  
+  const orderId = ctx.match[1];
+  
+  try {
+    const order = await Order.findById(orderId);
     
-    try {
-        const order = await ordersCollection.findOne({ _id: orderId });
-        
-        if (!order) {
-            await ctx.answerCbQuery('❌ Order tidak ditemukan');
-            return;
+    if (!order) {
+      const message = await ctx.reply(
+        `❌ Order not found.`,
+        {
+          reply_markup: {
+            inline_keyboard: [
+              [{ text: '🔙 Back to History', callback_data: 'order_history' }]
+            ]
+          }
         }
-        
-        // Check status for first order
-        const firstStatusResponse = await axios.post(config.apiUrl, {
-            api_key: config.apiKey,
-            action: 'status',
-            secret_key: config.secretKey,
-            id: order.firstOrderId
-        });
-        
-        // Check status for second order
-        const secondStatusResponse = await axios.post(config.apiUrl, {
-            api_key: config.apiKey,
-            action: 'status',
-            secret_key: config.secretKey,
-            id: order.secondOrderId
-        });
-        
-        if (!firstStatusResponse.data.status || !secondStatusResponse.data.status) {
-            throw new Error('Gagal mendapatkan status order');
-        }
-        
-        const firstStatus = firstStatusResponse.data.data.status;
-        const secondStatus = secondStatusResponse.data.data.status;
-        
-        // Update order status in database
-        await ordersCollection.updateOne(
-            { _id: orderId },
-            { $set: { 
-                status: firstStatus,
-                firstStatus,
-                secondStatus,
-                lastChecked: new Date()
-            }}
-        );
-        
-        let message = `📊 *Detail Order ${orderId}*\n\n`;
-        message += `🔗 Link: ${order.link}\n\n`;
-        message += `📊 Status API 1: ${firstStatus}\n`;
-        message += `🔢 Start Count API 1: ${firstStatusResponse.data.data.start_count}\n`;
-        message += `📉 Remains API 1: ${firstStatusResponse.data.data.remains}\n\n`;
-        message += `📊 Status API 2: ${secondStatus}\n`;
-        message += `🔢 Start Count API 2: ${secondStatusResponse.data.data.start_count}\n`;
-        message += `📉 Remains API 2: ${secondStatusResponse.data.data.remains}\n\n`;
-        message += `📅 Last Updated: ${new Date().toLocaleString()}`;
-        
-        await ctx.editMessageText(message, {
-            parse_mode: 'Markdown',
-            reply_markup: Markup.inlineKeyboard([
-                [Markup.button.callback('🔄 Refresh', `check_order_${orderId}`)],
-                [Markup.button.callback('🔙 Kembali ke Riwayat', 'view_history')]
-            ])
-        });
-    } catch (error) {
-        console.error('Error checking order status:', error);
-        await ctx.editMessageText(`❌ Terjadi kesalahan saat mengecek status order: ${error.message}`, {
-            reply_markup: Markup.inlineKeyboard([
-                [Markup.button.callback('🔙 Kembali ke Riwayat', 'view_history')]
-            ])
-        });
+      );
+      
+      ctx.session.lastBotMessageId = message.message_id;
+      return;
     }
     
-    await ctx.answerCbQuery();
-});
-
-bot.action('redeem_code', async (ctx) => {
-    await ctx.scene.enter('redeemCode');
-    await ctx.answerCbQuery();
-});
-
-bot.action('back_to_menu', async (ctx) => {
-    await showMainMenu(ctx);
-    await ctx.answerCbQuery();
-});
-
-// Start the bot
-async function startBot() {
-    await connectToMongoDB();
+    // Message with order details
+    let statusMessage = `*Order Details* 📋\n\n`;
+    statusMessage += `Date: ${order.createdAt.toLocaleString()}\n`;
+    statusMessage += `Link: ${order.link}\n`;
+    statusMessage += `Current Status: ${order.status}\n\n`;
     
-    // Configure session middleware for concurrent user support
-    bot.use((ctx, next) => {
-        // Ensure each user has their own session context
-        ctx.session = ctx.session || {};
-        return next();
-    });
-    
-    await bot.launch({
-        // Enable concurrent processing of updates
-        dropPendingUpdates: false,
-        allowedUpdates: ['message', 'callback_query', 'inline_query']
-    });
-    
-    console.log('Bot started with concurrent user support');
-    
-    // Notify admins that bot is online
-    for (const adminId of config.adminId) {
+    // Check status from API if we have order IDs
+    if (order.followersOrderId || order.likesOrderId) {
+      statusMessage += `Checking current status from server...\n\n`;
+      
+      const message = await ctx.reply(
+        statusMessage,
+        {
+          parse_mode: 'Markdown',
+          reply_markup: {
+            inline_keyboard: [
+              [{ text: '🔄 Refreshing...', callback_data: 'refreshing' }]
+            ]
+          }
+        }
+      );
+      
+      ctx.session.lastBotMessageId = message.message_id;
+      
+      // Check followers status
+      if (order.followersOrderId) {
         try {
-            await bot.telegram.sendMessage(adminId, 
-                '🤖 *Bot is now online!*\n\nReady to process orders from multiple users concurrently.', 
-                { parse_mode: 'Markdown' }
-            );
-        } catch (e) {
-            console.error(`Failed to notify admin ${adminId} about startup:`, e);
+          const followersResponse = await axios.post(config.apiUrl, {
+            api_key: config.apiKey,
+            action: 'status',
+            secret_key: config.secretKey,
+            id: order.followersOrderId
+          });
+          
+          if (followersResponse.data.status) {
+            statusMessage += `*Followers Status:* ${followersResponse.data.data.status}\n`;
+            
+            if (followersResponse.data.data.start_count) {
+              statusMessage += `Start Count: ${followersResponse.data.data.start_count}\n`;
+            }
+            
+            if (followersResponse.data.data.remains !== undefined) {
+              statusMessage += `Remains: ${followersResponse.data.data.remains}\n`;
+            }
+            
+            statusMessage += `\n`;
+          }
+        } catch (error) {
+          statusMessage += `Could not fetch followers status.\n\n`;
         }
+      }
+      
+      // Check likes status
+      if (order.likesOrderId) {
+        try {
+          const likesResponse = await axios.post(config.apiUrl, {
+            api_key: config.apiKey,
+            action: 'status',
+            secret_key: config.secretKey,
+            id: order.likesOrderId
+          });
+          
+          if (likesResponse.data.status) {
+            statusMessage += `*Likes Status:* ${likesResponse.data.data.status}\n`;
+            
+            if (likesResponse.data.data.start_count) {
+              statusMessage += `Start Count: ${likesResponse.data.data.start_count}\n`;
+            }
+            
+            if (likesResponse.data.data.remains !== undefined) {
+              statusMessage += `Remains: ${likesResponse.data.data.remains}\n`;
+            }
+          }
+        } catch (error) {
+          statusMessage += `Could not fetch likes status.\n`;
+        }
+      }
+      
+      // Update message with status
+      await ctx.telegram.editMessageText(
+        ctx.chat.id,
+        message.message_id,
+        null,
+        statusMessage,
+        {
+          parse_mode: 'Markdown',
+          reply_markup: {
+            inline_keyboard: [
+              [{ text: '🔄 Refresh Status', callback_data: `check_order_${orderId}` }],
+              [{ text: '🔙 Back to History', callback_data: 'order_history' }]
+            ]
+          }
+        }
+      );
+      
+    } else {
+      // No order IDs available
+      statusMessage += `No external order IDs available for this order.`;
+      
+      const message = await ctx.reply(
+        statusMessage,
+        {
+          parse_mode: 'Markdown',
+          reply_markup: {
+            inline_keyboard: [
+              [{ text: '🔙 Back to History', callback_data: 'order_history' }]
+            ]
+          }
+        }
+      );
+      
+      ctx.session.lastBotMessageId = message.message_id;
     }
-}
+    
+  } catch (error) {
+    console.error('Error checking order status:', error);
+    
+    const message = await ctx.reply(
+      `❌ Error checking order status. Please try again later.`,
+      {
+        reply_markup: {
+          inline_keyboard: [
+            [{ text: '🔙 Back to History', callback_data: 'order_history' }]
+          ]
+        }
+      }
+    );
+    
+    ctx.session.lastBotMessageId = message.message_id;
+  }
+});
 
-startBot().catch(console.error);
+// Handle refreshing action (do nothing)
+bot.action('refreshing', (ctx) => {
+  ctx.answerCbQuery('Refreshing status...');
+});
+
+// Error handler
+bot.catch((err, ctx) => {
+  console.error(`Error for ${ctx.updateType}:`, err);
+  
+  ctx.reply(
+    `❌ An error occurred while processing your request.\n\n` +
+    `Please try again or contact admin: ${config.contactAdmin}`,
+    {
+      reply_markup: {
+        inline_keyboard: [
+          [{ text: '🔄 Back to Main Menu', callback_data: 'back_to_main' }],
+          [{ text: '👨‍💼 Contact Admin', url: config.contactAdminUrl }]
+        ]
+      }
+    }
+  );
+});
+
+// Start bot
+bot.launch()
+  .then(() => {
+    console.log('Bot started successfully!');
+  })
+  .catch(err => {
+    console.error('Error starting bot:', err);
+  });
 
 // Enable graceful stop
 process.once('SIGINT', () => bot.stop('SIGINT'));
 process.once('SIGTERM', () => bot.stop('SIGTERM'));
+
+// Middleware
+bot.use(session());
+
+// Check if user exists in DB, if not create new user
+bot.use(async (ctx, next) => {
+  if (ctx.from) {
+    const userId = ctx.from.id.toString();
+    let user = await User.findOne({ userId });
+    
+    if (!user) {
+      user = new User({
+        userId,
+        username: ctx.from.username || 'NoUsername',
+        firstName: ctx.from.first_name,
+        lastName: ctx.from.last_name,
+        linkLimit: 0,
+        createdAt: new Date()
+      });
+      await user.save();
+    }
+  }
+  return next();
+});
+
+// Helper function to check if user is admin
+const isAdmin = (userId) => {
+  return config.adminId.includes(userId.toString());
+};
+
+// Delete previous message
+const deletePrevMessage = async (ctx) => {
+  if (ctx.session && ctx.session.lastBotMessageId) {
+    try {
+      await ctx.deleteMessage(ctx.session.lastBotMessageId);
+    } catch (error) {
+      console.log('Error deleting message:', error);
+    }
+  }
+};
+
+// Start command
+bot.start(async (ctx) => {
+  await deletePrevMessage(ctx);
+  
+  const userId = ctx.from.id.toString();
+  const user = await User.findOne({ userId });
+  const isUserAdmin = isAdmin(userId);
+  
+  let keyboard;
+  
+  if (isUserAdmin) {
+    keyboard = {
+      inline_keyboard: [
+        [{ text: '👥 User Menu', callback_data: 'user_menu' }],
+        [{ text: '👑 Admin Menu', callback_data: 'admin_menu' }]
+      ]
+    };
+  } else {
+    keyboard = {
+      inline_keyboard: [
+        [{ text: '🛒 Order', callback_data: 'order' }, { text: '💰 Check Limit', callback_data: 'check_limit' }],
+        [{ text: '📚 Order History', callback_data: 'order_history' }, { text: '🎟️ Redeem Code', callback_data: 'redeem_code' }],
+        [{ text: '👨‍💼 Contact Admin', url: config.contactAdminUrl }]
+      ]
+    };
+  }
+  
+  const message = await ctx.reply(
+    `*Welcome to Auto Order Bot* 🤖\n\n` +
+    `Hello ${ctx.from.first_name}! ${isUserAdmin ? '(Admin)' : ''}\n` +
+    `Your current link limit: *${user.linkLimit}*\n\n` +
+    `Choose an option below:`,
+    {
+      parse_mode: 'Markdown',
+      reply_markup: keyboard
+    }
+  );
+  
+  ctx.session.lastBotMessageId = message.message_id;
+});
+
+// Admin Menu
+bot.action('admin_menu', async (ctx) => {
+  if (!isAdmin(ctx.from.id)) {
+    return await ctx.answerCbQuery('You are not authorized to access admin menu.');
+  }
+  
+  await ctx.answerCbQuery();
+  await deletePrevMessage(ctx);
+  
+  const keyboard = {
+    inline_keyboard: [
+      [{ text: '➕ Add Code', callback_data: 'add_code' }],
+      [{ text: '👥 Check User Limits', callback_data: 'check_user_limits' }],
+      [{ text: '🔙 Back to Main Menu', callback_data: 'back_to_main' }]
+    ]
+  };
+  
+  const message = await ctx.reply(
+    `*Admin Menu* 👑\n\n` +
+    `Select an admin action:`,
+    {
+      parse_mode: 'Markdown',
+      reply_markup: keyboard
+    }
+  );
+  
+  ctx.session.lastBotMessageId = message.message_id;
+});
+
+// User Menu
+bot.action('user_menu', async (ctx) => {
+  await ctx.answerCbQuery();
+  await deletePrevMessage(ctx);
+  
+  const userId = ctx.from.id.toString();
+  const user = await User.findOne({ userId });
+  
+  const keyboard = {
+    inline_keyboard: [
+      [{ text: '🛒 Order', callback_data: 'order' }, { text: '💰 Check Limit', callback_data: 'check_limit' }],
+      [{ text: '📚 Order History', callback_data: 'order_history' }, { text: '🎟️ Redeem Code', callback_data: 'redeem_code' }],
+      [{ text: '👨‍💼 Contact Admin', url: config.contactAdminUrl }],
+      [{ text: '🔙 Back to Main Menu', callback_data: 'back_to_main' }]
+    ]
+  };
+  
+  const message = await ctx.reply(
+    `*User Menu* 👤\n\n` +
+    `Your current link limit: *${user.linkLimit}*\n\n` +
+    `Choose an option:`,
+    {
+      parse_mode: 'Markdown',
+      reply_markup: keyboard
+    }
+  );
+  
+  ctx.session.lastBotMessageId = message.message_id;
+});
+
+// Back to main menu
+bot.action('back_to_main', async (ctx) => {
+  await ctx.answerCbQuery();
+  ctx.session = {};
+  await ctx.deleteMessage();
+  await ctx.command('start');
+});
+
+// Add Code (Admin)
+bot.action('add_code', async (ctx) => {
+  if (!isAdmin(ctx.from.id)) {
+    return await ctx.answerCbQuery('You are not authorized.');
+  }
+  
+  await ctx.answerCbQuery();
+  await deletePrevMessage(ctx);
+  
+  ctx.session.adminAction = 'add_code';
+  
+  const message = await ctx.reply(
+    `*Add Code* 🎟️\n\n` +
+    `Please enter the code amount in this format:\n` +
+    `\`add_code <amount>\`\n\n` +
+    `Example: \`add_code 10\``,
+    {
+      parse_mode: 'Markdown',
+      reply_markup: {
+        inline_keyboard: [
+          [{ text: '🔙 Back to Admin Menu', callback_data: 'admin_menu' }]
+        ]
+      }
+    }
+  );
+  
+  ctx.session.lastBotMessageId = message.message_id;
+});
+
+// Handle add_code text input
+bot.hears(/^add_code (\d+)$/, async (ctx) => {
+  if (!isAdmin(ctx.from.id) || ctx.session.adminAction !== 'add_code') {
+    return;
+  }
+  
+  await deletePrevMessage(ctx);
+  await ctx.deleteMessage();
+  
+  const amount = parseInt(ctx.match[1]);
+  
+  if (isNaN(amount) || amount <= 0) {
+    const message = await ctx.reply(
+      `❌ Invalid amount. Please enter a valid positive number.`,
+      {
+        reply_markup: {
+          inline_keyboard: [
+            [{ text: '🔙 Back to Admin Menu', callback_data: 'admin_menu' }]
+          ]
+        }
+      }
+    );
+    ctx.session.lastBotMessageId = message.message_id;
+    return;
+  }
+  
+  // Generate unique code
+  const code = crypto.randomBytes(16).toString('hex');
+  
+  // Create redeem code in database
+  const redeemCode = new RedeemCode({
+    code,
+    amount,
+    createdBy: ctx.from.id.toString(),
+    isUsed: false,
+    createdAt: new Date()
+  });
+  
+  await redeemCode.save();
+  
+  // Create file with code
+  const fileName = `code_${code}.txt`;
+  const fileContent = `REDEEM CODE: ${code}\nAmount: ${amount} links\nGenerated by: ${ctx.from.username || ctx.from.first_name}\nDate: ${new Date().toLocaleString()}\n\nTo redeem this code, send it to the bot using the "Redeem Code" option.`;
+  
+  fs.writeFileSync(fileName, fileContent);
+  
+  // Send file to admin
+  await ctx.replyWithDocument({ source: fileName }, {
+    caption: `✅ Code generated successfully!\n\nAmount: ${amount} links\nCode: ||${code}||\n\nThis file can be shared with users.`,
+    parse_mode: 'MarkdownV2'
+  });
+  
+  // Delete temporary file
+  fs.unlinkSync(fileName);
+  
+  const message = await ctx.reply(
+    `✅ Code added successfully!`,
+    {
+      reply_markup: {
+        inline_keyboard: [
+          [{ text: '🔙 Back to Admin Menu', callback_data: 'admin_menu' }]
+        ]
+      }
+    }
+  );
+  
+  ctx.session.lastBotMessageId = message.message_id;
+});
+
+// Check User Limits (Admin)
+bot.action('check_user_limits', async (ctx) => {
+  if (!isAdmin(ctx.from.id)) {
+    return await ctx.answerCbQuery('You are not authorized.');
+  }
+  
+  await ctx.answerCbQuery();
+  await deletePrevMessage(ctx);
+  
+  const users = await User.find().sort({ linkLimit: -1 });
+  
+  let message = `*User Limits* 📊\n\n`;
+  
+  if (users.length === 0) {
+    message += `No users found.`;
+  } else {
+    users.forEach((user, index) => {
+      message += `${index + 1}. ${user.username || user.firstName} - ${user.linkLimit} links\n`;
+    });
+  }
+  
+  const sentMessage = await ctx.reply(
+    message,
+    {
+      parse_mode: 'Markdown',
+      reply_markup: {
+        inline_keyboard: [
+          [{ text: '🔙 Back to Admin Menu', callback_data: 'admin_menu' }]
+        ]
+      }
+    }
+  );
+  
+  ctx.session.lastBotMessageId = sentMessage.message_id;
+});
+
+// Check Limit (User)
+bot.action('check_limit', async (ctx) => {
+  await ctx.answerCbQuery();
+  await deletePrevMessage(ctx);
+  
+  const userId = ctx.from.id.toString();
+  const user = await User.findOne({ userId });
+  
+  const message = await ctx.reply(
+    `*Your Link Limit* 💰\n\n` +
+    `Current limit: *${user.linkLimit} links*\n\n` +
+    `Each link order requires 1 limit.\n` +
+    `Need more limits? Redeem a code or contact admin: ${config.contactAdmin}`,
+    {
+      parse_mode: 'Markdown',
+      reply_markup: {
+        inline_keyboard: [
+          [{ text: '🎟️ Redeem Code', callback_data: 'redeem_code' }],
+          [{ text: '👨‍💼 Contact Admin', url: config.contactAdminUrl }],
+          [{ text: '🔙 Back', callback_data: 'user_menu' }]
+        ]
+      }
+    }
+  );
+  
+  ctx.session.lastBotMessageId = message.message_id;
+});
+
+// Order
+bot.action('order', async (ctx) => {
+  await ctx.answerCbQuery();
+  await deletePrevMessage(ctx);
+  
+  const userId = ctx.from.id.toString();
+  const user = await User.findOne({ userId });
+  
+  if (user.linkLimit <= 0) {
+    const message = await ctx.reply(
+      `❌ *Insufficient Link Limit*\n\n` +
+      `You don't have enough link limit to place an order.\n` +
+      `Current limit: *0 links*\n\n` +
+      `Please redeem a code or contact admin: ${config.contactAdmin}`,
+      {
+        parse_mode: 'Markdown',
+        reply_markup: {
+          inline_keyboard: [
+            [{ text: '🎟️ Redeem Code', callback_data: 'redeem_code' }],
+            [{ text: '👨‍💼 Contact Admin', url: config.contactAdminUrl }],
+            [{ text: '🔙 Back', callback_data: 'user_menu' }]
+          ]
+        }
+      }
+    );
+    
+    ctx.session.lastBotMessageId = message.message_id;
+    return;
+  }
+  
+  // Verify service IDs are available
+  try {
+    const response = await axios.post(config.apiUrl, {
+      api_key: config.apiKey,
+      action: 'services',
+      secret_key: config.secretKey
+    });
+    
+    if (!response.data.status) {
+      throw new Error('API returned error');
+    }
+    
+    const services = response.data.data;
+    
+    // Check if service IDs exist and prices are within limits
+    const followersService = services.find(s => s.id.toString() === config.serviceIds.followers);
+    const likesService = services.find(s => s.id.toString() === config.serviceIds.likes);
+    
+    if (!followersService) {
+      throw new Error(`Service ID ${config.serviceIds.followers} not found`);
+    }
+    
+    if (!likesService) {
+      throw new Error(`Service ID ${config.serviceIds.likes} not found`);
+    }
+    
+    if (followersService.price > config.maxPrice.followers) {
+      throw new Error(`Service ${config.serviceIds.followers} price exceeds limit`);
+    }
+    
+    if (likesService.price > config.maxPrice.likes) {
+      throw new Error(`Service ${config.serviceIds.likes} price exceeds limit`);
+    }
+  } catch (error) {
+    console.error('Error verifying services:', error);
+    
+    const message = await ctx.reply(
+      `❌ *Service Error*\n\n` +
+      `Unable to verify services at the moment. Please try again later or contact admin.`,
+      {
+        parse_mode: 'Markdown',
+        reply_markup: {
+          inline_keyboard: [
+            [{ text: '🔄 Try Again', callback_data: 'order' }],
+            [{ text: '👨‍💼 Contact Admin', url: config.contactAdminUrl }],
+            [{ text: '🔙 Back', callback_data: 'user_menu' }]
+          ]
+        }
+      }
+    );
+    
+    ctx.session.lastBotMessageId = message.message_id;
+    return;
+  }
+  
+  ctx.session.orderState = 'waiting_for_links';
+  
+  const message = await ctx.reply(
+    `*New Order* 🛒\n\n` +
+    `Your current limit: *${user.linkLimit} links*\n\n` +
+    `Please send your Instagram links.\n` +
+    `Each link will require 1 limit.\n\n` +
+    `You can send multiple links - one per line, like this:\n` +
+    `https://instagram.com/...\n` +
+    `https://instagram.com/...\n\n` +
+    `*Note:* Maximum ${user.linkLimit} links allowed.`,
+    {
+      parse_mode: 'Markdown',
+      reply_markup: {
+        inline_keyboard: [
+          [{ text: '❌ Cancel', callback_data: 'cancel_order' }]
+        ]
+      }
+    }
+  );
+  
+  ctx.session.lastBotMessageId = message.message_id;
+});
+
+// Cancel Order
+bot.action('cancel_order', async (ctx) => {
+  await ctx.answerCbQuery();
+  await deletePrevMessage(ctx);
+  
+  delete ctx.session.orderState;
+  delete ctx.session.orderLinks;
+  
+  const message = await ctx.reply(
+    `✅ Order canceled.`,
+    {
+      reply_markup: {
+        inline_keyboard: [
+          [{ text: '🔙 Back to Menu', callback_data: 'user_menu' }]
+        ]
+      }
+    }
+  );
+  
+  ctx.session.lastBotMessageId = message.message_id;
+});
+
+// Handle links input
+bot.on('text', async (ctx) => {
+  if (ctx.session.orderState !== 'waiting_for_links') {
+    return;
+  }
+  
+  await deletePrevMessage(ctx);
+  
+  const text = ctx.message.text.trim();
+  const links = text.split('\n').map(link => link.trim()).filter(link => link.startsWith('http'));
+  
+  if (links.length === 0) {
+    const message = await ctx.reply(
+      `❌ *No valid links found*\n\n` +
+      `Please send valid Instagram links, each starting with http or https.`,
+      {
+        parse_mode: 'Markdown',
+        reply_markup: {
+          inline_keyboard: [
+            [{ text: '❌ Cancel', callback_data: 'cancel_order' }]
+          ]
+        }
+      }
+    );
+    
+    ctx.session.lastBotMessageId = message.message_id;
+    return;
+  }
+  
+  const userId = ctx.from.id.toString();
+  const user = await User.findOne({ userId });
+  
+  if (links.length > user.linkLimit) {
+    const message = await ctx.reply(
+      `❌ *Too many links*\n\n` +
+      `You sent ${links.length} links but your current limit is only ${user.linkLimit} links.\n\n` +
+      `Please send fewer links or contact admin to increase your limit.`,
+      {
+        parse_mode: 'Markdown',
+        reply_markup: {
+          inline_keyboard: [
+            [{ text: '🔄 Try Again', callback_data: 'order' }],
+            [{ text: '👨‍💼 Contact Admin', url: config.contactAdminUrl }],
+            [{ text: '❌ Cancel', callback_data: 'cancel_order' }]
+          ]
+        }
+      }
+    );
+    
+    ctx.session.lastBotMessageId = message.message_id;
+    return;
+  }
+  
+  // Store links in session
+  ctx.session.orderLinks = links;
+  ctx.session.orderState = 'confirm_order';
+  
+  // Delete user message with links
+  await ctx.deleteMessage(ctx.message.message_id);
+  
+  let linksText = '';
+  links.forEach((link, index) => {
+    linksText += `${index + 1}. ${link}\n`;
+  });
+  
+  const message = await ctx.reply(
+    `*Order Confirmation* 🛒\n\n` +
+    `You are about to order services for ${links.length} links:\n\n` +
+    `${linksText}\n` +
+    `This will use ${links.length} of your link limits.\n` +
+    `Current limit: ${user.linkLimit} links\n` +
+    `After order: ${user.linkLimit - links.length} links\n\n` +
+    `Services that will be ordered for each link:\n` +
+    `- Followers: ${config.serviceQuantity.followers}\n` +
+    `- Likes: ${config.serviceQuantity.likes}\n\n` +
+    `Would you like to proceed?`,
+    {
+      parse_mode: 'Markdown',
+      reply_markup: {
+        inline_keyboard: [
+          [{ text: '✅ Confirm Order', callback_data: 'confirm_order' }],
+          [{ text: '❌ Cancel', callback_data: 'cancel_order' }]
+        ]
+      }
+    }
+  );
+  
+  ctx.session.lastBotMessageId = message.message_id;
+});
+
+// Confirm Order
+bot.action('confirm_order', async (ctx) => {
+  await ctx.answerCbQuery();
+  
+  if (ctx.session.orderState !== 'confirm_order' || !ctx.session.orderLinks) {
+    return await ctx.reply('Order session expired. Please start a new order.');
+  }
+  
+  await deletePrevMessage(ctx);
+  
+  const userId = ctx.from.id.toString();
+  const user = await User.findOne({ userId });
+  const links = ctx.session.orderLinks;
+  
+  // Final confirmation
+  ctx.session.orderState = 'final_confirm';
+  
+  const message = await ctx.reply(
+    `*Final Confirmation* ⚠️\n\n` +
+    `You're about to place an order for ${links.length} links.\n\n` +
+    `❗ *IMPORTANT* ❗\n` +
+    `This action cannot be undone once confirmed.\n\n` +
+    `Are you 100% sure you want to proceed?`,
+    {
+      parse_mode: 'Markdown',
+      reply_markup: {
+        inline_keyboard: [
+          [{ text: '✅ Yes, I\'m 100% sure', callback_data: 'final_confirm' }],
+          [{ text: '❌ No, cancel', callback_data: 'cancel_order' }]
+        ]
+      }
+    }
+  );
+  
+  ctx.session.lastBotMessageId = message.message_id;
+});
+
+// Final Confirmation and Process Order
+bot.action('final_confirm', async (ctx) => {
+  await ctx.answerCbQuery();
+  
+  if (ctx.session.orderState !== 'final_confirm' || !ctx.session.orderLinks) {
+    return await ctx.reply('Order session expired. Please start a new order.');
+  }
+  
+  await deletePrevMessage(ctx);
+  
+  const userId = ctx.from.id.toString();
+  const user = await User.findOne({ userId });
+  const links = ctx.session.orderLinks;
+  
+  // Check limit one more time
+  if (links.length > user.linkLimit) {
+    const message = await ctx.reply(
+      `❌ *Insufficient link limit*\n\n` +
+      `Your link limit has changed during the order process.\n` +
+      `Required: ${links.length}\n` +
+      `Available: ${user.linkLimit}`,
+      {
+        parse_mode: 'Markdown',
+        reply_markup: {
+          inline_keyboard: [
+            [{ text: '🔙 Back to Menu', callback_data: 'user_menu' }]
+          ]
+        }
+      }
+    );
+    
+    ctx.session.lastBotMessageId = message.message_id;
+    return;
+  }
+  
+  // Processing message
+  const processingMsg = await ctx.reply(
+    `🔄 *Processing Order*\n\n` +
+    `Please wait while we process your ${links.length} links...`,
+    { parse_mode: 'Markdown' }
+  );
+  
+  // Array to store order results
+  const orderResults = [];
+  let successCount = 0;
+  let failedCount = 0;
+  
+  // Process each link
+  for (let i = 0; i < links.length; i++) {
+    const link = links[i];
+    
+    try {
+      // Create order in our database first
+      const newOrder = new Order({
+        userId,
+        link,
+        status: 'Pending',
+        createdAt: new Date()
+      });
+      
+      await newOrder.save();
+      
+      // Order followers
+      const followersResponse = await axios.post(config.apiUrl, {
+        api_key: config.apiKey,
+        action: 'order',
+        secret_key: config.secretKey,
+        service: config.serviceIds.followers,
+        data: link,
+        quantity: config.serviceQuantity.followers
+      });
+      
+      // Order likes
+      const likesResponse = await axios.post(config.apiUrl, {
+        api_key: config.apiKey,
+        action: 'order',
+        secret_key: config.secretKey,
+        service: config.serviceIds.likes,
+        data: link,
+        quantity: config.serviceQuantity.likes
+      });
+      
+      // Check responses
+      if (followersResponse.data.status && likesResponse.data.status) {
+        // Update order in database
+        newOrder.followersOrderId = followersResponse.data.data.id;
+        newOrder.likesOrderId = likesResponse.data.data.id;
+        newOrder.status = 'Processing';
+        await newOrder.save();
+        
+        orderResults.push({
+          link,
+          followers: {
+            orderId: followersResponse.data.data.id,
+            status: 'Success'
+          },
+          likes: {
+            orderId: likesResponse.data.data.id,
+            status: 'Success'
+          },
+          status: 'Success'
+        });
+        
+        successCount++;
+      } else {
+        // Something failed
+        newOrder.status = 'Error';
+        if (followersResponse.data.status) {
+          newOrder.followersOrderId = followersResponse.data.data.id;
+        }
+        if (likesResponse.data.status) {
+          newOrder.likesOrderId = likesResponse.data.data.id;
+        }
+        await newOrder.save();
+        
+        orderResults.push({
+          link,
+          status: 'Failed',
+          error: 'API returned error'
+        });
+        
+        failedCount++;
+      }
+      
+      // Update processing message to show progress
+      await ctx.telegram.editMessageText(
+        ctx.chat.id,
+        processingMsg.message_id,
+        null,
+        `🔄 *Processing Order*\n\n` +
+        `Progress: ${i + 1}/${links.length} links\n` +
+        `✅ Success: ${successCount}\n` +
+        `❌ Failed: ${failedCount}`,
+        { parse_mode: 'Markdown' }
+      );
+      
+    } catch (error) {
+      console.error(`Error processing link ${link}:`, error);
+      
+      orderResults.push({
+        link,
+        status: 'Failed',
+        error: error.message
+      });
+      
+      failedCount++;
+      
+      // Update processing message
+      await ctx.telegram.editMessageText(
+        ctx.chat.id,
+        processingMsg.message_id,
+        null,
+        `🔄 *Processing Order*\n\n` +
+        `Progress: ${i + 1}/${links.length} links\n` +
+        `✅ Success: ${successCount}\n` +
+        `❌ Failed: ${failedCount}`,
+        { parse_mode: 'Markdown' }
+      );
+    }
+  }
+  
+  // Deduct link limit
+  user.linkLimit -= successCount;
+  await user.save();
+  
+  // Clear order session
+  delete ctx.session.orderState;
+  delete ctx.session.orderLinks;
+  
+  // Delete processing message
+  await ctx.deleteMessage(processingMsg.message_id);
+  
+  // Prepare result message
+  let resultMessage = `*Order Completed* ✅\n\n`;
+  resultMessage += `Summary:\n`;
+  resultMessage += `✅ Successful orders: ${successCount}\n`;
+  resultMessage += `❌ Failed orders: ${failedCount}\n\n`;
+  
+  if (successCount > 0) {
+    resultMessage += `Your new link limit: ${user.linkLimit} links\n\n`;
+    resultMessage += `You can check order status in Order History.`;
+  }
+  
+  if (failedCount > 0) {
+    resultMessage += `\n\nSome orders failed. Please contact admin for assistance.`;
+  }
+  
+  const message = await ctx.reply(
+    resultMessage,
+    {
+      parse_mode: 'Markdown',
+      reply_markup: {
+        inline_keyboard: [
+          [{ text: '📚 View Order History', callback_data: 'order_history' }],
+          [{ text: '🔙 Back to Menu', callback_data: 'user_menu' }]
+        ]
+      }
+    }
+  );
+  
+  ctx.session.lastBotMessageId = message.message_id;
+});
+
+// Redeem Code
+bot.action('redeem_code', async (ctx) => {
+  await ctx.answerCbQuery();
+  await deletePrevMessage(ctx);
+  
+  ctx.session.redeemState = 'waiting_for_code';
+  
+  const message = await ctx.reply(
+    `*Redeem Code* 🎟️\n\n` +
+    `Please send the code file or enter the code directly.`,
+    {
+      parse_mode: 'Markdown',
+      reply_markup: {
+        inline_keyboard: [
+          [{ text: '❌ Cancel', callback_data: 'cancel_redeem' }]
+        ]
+      }
+    }
+  );
+  
+  ctx.session.lastBotMessageId = message.message_id;
+});
+
+// Cancel Redeem
+bot.action('cancel_redeem', async (ctx) => {
+  await ctx.answerCbQuery();
+  await deletePrevMessage(ctx);
+  
+  delete ctx.session.redeemState;
+  
+  const message = await ctx.reply(
+    `✅ Redeem process canceled.`,
+    {
+      reply_markup: {
+        inline_keyboard: [
+          [{ text: '🔙 Back to Menu', callback_data: 'user_menu' }]
+        ]
+      }
+    }
+  );
+  
+  ctx.session.lastBotMessageId = message.message_id;
+});
