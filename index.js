@@ -254,56 +254,69 @@ bot.on('document', async (ctx) => {
   
   if (session.waitingForRedeemFile) {
     const fileId = ctx.message.document.file_id;
-    const fileLink = await ctx.telegram.getFileLink(fileId);
     
     try {
-      const response = await axios.get(fileLink.toString(), { responseType: 'text' });
-      const fileData = response.data;
+      const fileLink = await ctx.telegram.getFileLink(fileId);
       
-      // Validate and decode file
-      const [hashPart, dataPart] = fileData.split('.');
-      const decodedData = Buffer.from(dataPart, 'base64').toString('utf8');
-      const calculatedHash = crypto.createHash('sha256').update(decodedData).digest('hex');
-      
-      if (hashPart !== calculatedHash) {
-        await ctx.reply('❌ Invalid redeem code file. The file has been tampered with.');
-        delete session.waitingForRedeemFile;
-        return;
-      }
-      
-      const codeData = JSON.parse(decodedData);
-      const codeString = codeData.code;
-      
-      // Check if code exists and is not redeemed
-      const codeDoc = await RedeemCode.findOne({ code: codeString });
-      
-      if (!codeDoc) {
-        await ctx.reply('❌ Invalid redeem code. Code not found.');
-      } else if (codeDoc.isRedeemed) {
-        await ctx.reply('❌ This code has already been redeemed.');
-      } else {
-        // Update user limit and mark code as redeemed
-        await User.findOneAndUpdate(
-          { userId },
-          { $inc: { limit: codeDoc.limit } }
-        );
+      try {
+        const response = await axios.get(fileLink.toString(), { responseType: 'text' });
+        const fileData = response.data;
         
-        await RedeemCode.findOneAndUpdate(
-          { code: codeString },
-          { 
-            isRedeemed: true,
-            redeemedBy: userId,
-            redeemedAt: new Date()
-          }
-        );
+        // Validate and decode file
+        const [hashPart, dataPart] = fileData.split('.');
+        const decodedData = Buffer.from(dataPart, 'base64').toString('utf8');
+        const calculatedHash = crypto.createHash('sha256').update(decodedData).digest('hex');
         
-        const user = await User.findOne({ userId });
+        if (hashPart !== calculatedHash) {
+          await ctx.reply('❌ Invalid redeem code file. The file has been tampered with.');
+          delete session.waitingForRedeemFile;
+          return;
+        }
         
-        await ctx.reply(`✅ Code successfully redeemed!\n\nAdded limit: ${codeDoc.limit}\nYour new total limit: ${user.limit}`);
+        const codeData = JSON.parse(decodedData);
+        const codeString = codeData.code;
+        
+        // Check if code exists and is not redeemed
+        const codeDoc = await RedeemCode.findOne({ code: codeString });
+        
+        if (!codeDoc) {
+          await ctx.reply('❌ Invalid redeem code. Code not found.');
+        } else if (codeDoc.isRedeemed) {
+          await ctx.reply('❌ This code has already been redeemed.');
+        } else {
+          // Update user limit and mark code as redeemed
+          await User.findOneAndUpdate(
+            { userId },
+            { $inc: { limit: codeDoc.limit } }
+          );
+          
+          await RedeemCode.findOneAndUpdate(
+            { code: codeString },
+            { 
+              isRedeemed: true,
+              redeemedBy: userId,
+              redeemedAt: new Date()
+            }
+          );
+          
+          const user = await User.findOne({ userId });
+          
+          await ctx.reply(`✅ Code successfully redeemed!\n\nAdded limit: ${codeDoc.limit}\nYour new total limit: ${user.limit}`);
+        }
+      } catch (error) {
+        console.error('Redeem file processing error:', error);
+        
+        // Enhanced error logging
+        if (error.response) {
+          console.error('Response status:', error.response.status);
+          console.error('Response data:', error.response.data);
+        }
+        
+        await ctx.reply('❌ Error processing the redeem code file. Please try again or contact admin.');
       }
     } catch (error) {
-      console.error('Redeem error:', error);
-      await ctx.reply('❌ Error processing the redeem code. Please try again or contact admin.');
+      console.error('Error getting file link:', error);
+      await ctx.reply('❌ Error accessing the file. Please try again or contact admin.');
     }
     
     delete session.waitingForRedeemFile;
@@ -331,27 +344,35 @@ bot.action('check_all_limits', async (ctx) => {
     return;
   }
   
-  const allUsers = await User.find().sort({ limit: -1 });
-  
-  let message = '👥 *All User Limits*\n\n';
-  
-  allUsers.forEach((u, index) => {
-    message += `${index + 1}. ${u.username || 'Unknown'} - *${u.limit}* links\n`;
-  });
-  
-  if (message.length > 4000) {
-    // If message is too long, create a file
-    fs.writeFileSync('user_limits.txt', message.replace(/\*/g, ''));
+  try {
+    const allUsers = await User.find().sort({ limit: -1 });
     
-    await ctx.replyWithDocument({ source: 'user_limits.txt' });
-    fs.unlinkSync('user_limits.txt');
+    let message = '👥 *All User Limits*\n\n';
     
-    await ctx.editMessageText('👥 *All User Limits*\n\nUser list has been sent as a file due to its length.', {
-      parse_mode: 'Markdown',
-      ...Markup.inlineKeyboard([[Markup.button.callback('🔙 Back', 'admin_menu')]])
+    allUsers.forEach((u, index) => {
+      message += `${index + 1}. ${u.username || 'Unknown'} - *${u.limit}* links\n`;
     });
-  } else {
-    await ctx.editMessageText(message, {
+    
+    if (message.length > 4000) {
+      // If message is too long, create a file
+      fs.writeFileSync('user_limits.txt', message.replace(/\*/g, ''));
+      
+      await ctx.replyWithDocument({ source: 'user_limits.txt' });
+      fs.unlinkSync('user_limits.txt');
+      
+      await ctx.editMessageText('👥 *All User Limits*\n\nUser list has been sent as a file due to its length.', {
+        parse_mode: 'Markdown',
+        ...Markup.inlineKeyboard([[Markup.button.callback('🔙 Back', 'admin_menu')]])
+      });
+    } else {
+      await ctx.editMessageText(message, {
+        parse_mode: 'Markdown',
+        ...Markup.inlineKeyboard([[Markup.button.callback('🔙 Back', 'admin_menu')]])
+      });
+    }
+  } catch (error) {
+    console.error('Error fetching user limits:', error);
+    await ctx.editMessageText('❌ Error fetching user limits. Please try again.', {
       parse_mode: 'Markdown',
       ...Markup.inlineKeyboard([[Markup.button.callback('🔙 Back', 'admin_menu')]])
     });
@@ -397,22 +418,30 @@ bot.action('confirm_order', async (ctx) => {
   
   const links = session.orderLinks;
   
-  // Deduct user limit
-  await User.findOneAndUpdate(
-    { userId },
-    { $inc: { limit: -links.length } }
-  );
-  
-  // Final confirmation
-  await ctx.editMessageText(`⚠️ *Final Confirmation*\n\nYou are about to order ${links.length} links. This action cannot be undone.\n\nAre you absolutely sure?`, {
-    parse_mode: 'Markdown',
-    ...Markup.inlineKeyboard([
-      [
-        Markup.button.callback('✅ Complete Order (100%)', 'process_order'),
-        Markup.button.callback('❌ Cancel', 'cancel_final')
-      ]
-    ])
-  });
+  try {
+    // Deduct user limit
+    await User.findOneAndUpdate(
+      { userId },
+      { $inc: { limit: -links.length } }
+    );
+    
+    // Final confirmation
+    await ctx.editMessageText(`⚠️ *Final Confirmation*\n\nYou are about to order ${links.length} links. This action cannot be undone.\n\nAre you absolutely sure?`, {
+      parse_mode: 'Markdown',
+      ...Markup.inlineKeyboard([
+        [
+          Markup.button.callback('✅ Complete Order (100%)', 'process_order'),
+          Markup.button.callback('❌ Cancel', 'cancel_final')
+        ]
+      ])
+    });
+  } catch (error) {
+    console.error('Error deducting limit:', error);
+    await ctx.editMessageText('❌ Error processing your order. Please try again.', {
+      parse_mode: 'Markdown',
+      ...Markup.inlineKeyboard([[Markup.button.callback('🔙 Back', 'back_to_main')]])
+    });
+  }
 });
 
 // Process the final order
@@ -435,20 +464,30 @@ bot.action('process_order', async (ctx) => {
   
   // First, check available services
   try {
+    console.log('Making services API request to:', config.API_URL);
+    console.log('Request parameters: api_key, action=services, secret_key');
+    
     const servicesResponse = await axios.post(config.API_URL, {
       api_key: config.API_KEY,
       action: 'services',
       secret_key: config.SECRET_KEY
     });
     
+    console.log('Services API response status:', servicesResponse.status);
+    console.log('Services API response.data.status:', servicesResponse.data.status);
+    
     if (!servicesResponse.data.status) {
+      console.error('Services API returned success=false:', servicesResponse.data);
+      
       // Refund the user's limit
       await User.findOneAndUpdate(
         { userId },
         { $inc: { limit: links.length } }
       );
       
-      await ctx.editMessageText('❌ *Order Failed*\n\nCould not fetch services from provider. Your limit has been refunded.', {
+      await ctx.editMessageText('❌ *Order Failed*\n\nCould not fetch services from provider. Error: ' + 
+        (servicesResponse.data.error || 'Unknown error') + 
+        '\n\nYour limit has been refunded.', {
         parse_mode: 'Markdown',
         ...Markup.inlineKeyboard([[Markup.button.callback('🔙 Back', 'back_to_main')]])
       });
@@ -457,10 +496,17 @@ bot.action('process_order', async (ctx) => {
     
     // Verify the services exist and check their max prices
     const services = servicesResponse.data.data;
+    console.log(`Looking for services with IDs: ${config.SERVICE_ID_1} and ${config.SERVICE_ID_2}`);
+    
     const service1 = services.find(s => s.id.toString() === config.SERVICE_ID_1);
     const service2 = services.find(s => s.id.toString() === config.SERVICE_ID_2);
     
     if (!service1 || !service2) {
+      console.error('Services not found in API response:');
+      console.error('Service 1 found:', !!service1);
+      console.error('Service 2 found:', !!service2);
+      console.error('Available service IDs:', services.map(s => s.id).join(', '));
+      
       // Refund the user's limit
       await User.findOneAndUpdate(
         { userId },
@@ -474,7 +520,14 @@ bot.action('process_order', async (ctx) => {
       return;
     }
     
+    console.log('Service 1 price:', service1.price);
+    console.log('Service 2 price:', service2.price);
+    
     if (service1.price > 7000 || service2.price > 40000) {
+      console.error('Service price exceeds maximum allowed:');
+      console.error('Service 1 price:', service1.price, 'Max: 7000');
+      console.error('Service 2 price:', service2.price, 'Max: 40000');
+      
       // Refund the user's limit
       await User.findOneAndUpdate(
         { userId },
@@ -502,7 +555,10 @@ bot.action('process_order', async (ctx) => {
           });
         }
         
+        console.log(`Processing link ${index + 1}/${links.length}: ${link}`);
+        
         // Process first service
+        console.log(`Placing order for service ${config.SERVICE_ID_1}`);
         const order1Response = await axios.post(config.API_URL, {
           api_key: config.API_KEY,
           action: 'order',
@@ -512,7 +568,10 @@ bot.action('process_order', async (ctx) => {
           quantity: config.QUANTITY_1
         });
         
+        console.log(`Service ${config.SERVICE_ID_1} response:`, order1Response.data);
+        
         // Process second service
+        console.log(`Placing order for service ${config.SERVICE_ID_2}`);
         const order2Response = await axios.post(config.API_URL, {
           api_key: config.API_KEY,
           action: 'order',
@@ -521,6 +580,8 @@ bot.action('process_order', async (ctx) => {
           data: link,
           quantity: config.QUANTITY_2
         });
+        
+        console.log(`Service ${config.SERVICE_ID_2} response:`, order2Response.data);
         
         if (order1Response.data.status && order2Response.data.status) {
           successful++;
@@ -543,10 +604,19 @@ bot.action('process_order', async (ctx) => {
           orderIds.push(order2Response.data.data.id);
         } else {
           failed++;
+          console.error('Failed to place order:');
+          console.error('Service 1 response:', order1Response.data);
+          console.error('Service 2 response:', order2Response.data);
         }
       } catch (error) {
         failed++;
         console.error(`Error processing link ${link}:`, error.message);
+        
+        // Enhanced error logging
+        if (error.response) {
+          console.error('Response status:', error.response.status);
+          console.error('Response data:', error.response.data);
+        }
       }
     }
     
@@ -566,7 +636,34 @@ bot.action('process_order', async (ctx) => {
     delete session.waitingForLinks;
     
   } catch (error) {
-    console.error('Order processing error:', error);
+    console.error('Order processing error:', error.message);
+    
+    // Enhanced error logging
+    console.error('Services API error details:');
+    console.error('Error message:', error.message);
+    
+    // Log response data if available
+    if (error.response) {
+      console.error('Status code:', error.response.status);
+      console.error('Response data:', JSON.stringify(error.response.data, null, 2));
+      console.error('Response headers:', JSON.stringify(error.response.headers, null, 2));
+    }
+    
+    // Log request details
+    if (error.config) {
+      console.error('Request URL:', error.config.url);
+      console.error('Request method:', error.config.method);
+      console.error('Request headers:', JSON.stringify(error.config.headers, null, 2));
+      
+      // Don't log the full body as it may contain sensitive data
+      if (error.config.data) {
+        try {
+          console.error('Request data keys:', Object.keys(JSON.parse(error.config.data)));
+        } catch (e) {
+          console.error('Could not parse request data');
+        }
+      }
+    }
     
     // Refund the user's limit
     await User.findOneAndUpdate(
