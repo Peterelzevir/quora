@@ -468,9 +468,9 @@ bot.action('process_order', async (ctx) => {
     console.log('Request parameters: api_key, action=services, secret_key');
     
     const servicesResponse = await axios.post(config.API_URL, {
-      api_key: config.API_KEY,
+      api_key: '72crqbuf4xi8enlp82agfdb5yhtx17c9',
       action: 'services',
-      secret_key: config.SECRET_KEY
+      secret_key: 'n74pdp63j071juiqxye52lkiw61rcc29rzgxsbmkasudo4l89o'
     });
     
     console.log('Services API response status:', servicesResponse.status);
@@ -560,9 +560,9 @@ bot.action('process_order', async (ctx) => {
         // Process first service
         console.log(`Placing order for service ${config.SERVICE_ID_1}`);
         const order1Response = await axios.post(config.API_URL, {
-          api_key: config.API_KEY,
+          api_key: '72crqbuf4xi8enlp82agfdb5yhtx17c9',
           action: 'order',
-          secret_key: config.SECRET_KEY,
+          secret_key: 'n74pdp63j071juiqxye52lkiw61rcc29rzgxsbmkasudo4l89o',
           service: config.SERVICE_ID_1,
           data: link,
           quantity: config.QUANTITY_1
