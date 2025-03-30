@@ -1,40 +1,54 @@
-// models.js - Database models
+// models.js
 const mongoose = require('mongoose');
 
-// User Schema
+// User model schema
 const userSchema = new mongoose.Schema({
   userId: {
     type: String,
     required: true,
     unique: true
   },
-  username: {
-    type: String,
-    default: null
-  },
-  firstName: {
-    type: String,
-    default: null
-  },
-  lastName: {
-    type: String,
-    default: null
-  },
-  linkLimit: {
+  username: String,
+  firstName: String,
+  limit: {
     type: Number,
     default: 0
   },
-  createdAt: {
-    type: Date,
-    default: Date.now
+  isAdmin: {
+    type: Boolean,
+    default: false
   },
-  lastActive: {
+  createdAt: {
     type: Date,
     default: Date.now
   }
 });
 
-// Order Schema
+// Redeem code schema
+const redeemCodeSchema = new mongoose.Schema({
+  code: {
+    type: String,
+    required: true,
+    unique: true
+  },
+  limit: {
+    type: Number,
+    required: true
+  },
+  isRedeemed: {
+    type: Boolean,
+    default: false
+  },
+  createdBy: String,
+  redeemedBy: String,
+  redeemedAt: Date,
+  createdAt: {
+    type: Date,
+    default: Date.now
+  }
+});
+
+// Order schema
 const orderSchema = new mongoose.Schema({
   userId: {
     type: String,
@@ -44,75 +58,30 @@ const orderSchema = new mongoose.Schema({
     type: String,
     required: true
   },
-  followersOrderId: {
-    type: String,
-    default: null
-  },
-  likesOrderId: {
-    type: String,
-    default: null
-  },
+  service1Id: String,
+  service2Id: String,
+  order1Id: String,
+  order2Id: String,
   status: {
     type: String,
-    enum: ['Pending', 'Processing', 'Partial', 'In progress', 'Error', 'Success'],
-    default: 'Pending'
+    default: 'Pending',
+    enum: ['Pending', 'Processing', 'Partial', 'In progress', 'Error', 'Success']
   },
+  quantity1: Number,
+  quantity2: Number,
   createdAt: {
-    type: Date,
-    default: Date.now
-  },
-  updatedAt: {
     type: Date,
     default: Date.now
   }
 });
 
-// Update the 'updatedAt' field on save
-orderSchema.pre('save', function(next) {
-  this.updatedAt = Date.now();
-  next();
-});
-
-// Redeem Code Schema
-const redeemCodeSchema = new mongoose.Schema({
-  code: {
-    type: String,
-    required: true,
-    unique: true
-  },
-  amount: {
-    type: Number,
-    required: true
-  },
-  createdBy: {
-    type: String,
-    required: true
-  },
-  isUsed: {
-    type: Boolean,
-    default: false
-  },
-  usedBy: {
-    type: String,
-    default: null
-  },
-  createdAt: {
-    type: Date,
-    default: Date.now
-  },
-  usedAt: {
-    type: Date,
-    default: null
-  }
-});
-
-// Create models
+// Create and export models
 const User = mongoose.model('User', userSchema);
-const Order = mongoose.model('Order', orderSchema);
 const RedeemCode = mongoose.model('RedeemCode', redeemCodeSchema);
+const Order = mongoose.model('Order', orderSchema);
 
 module.exports = {
   User,
-  Order,
-  RedeemCode
+  RedeemCode,
+  Order
 };
