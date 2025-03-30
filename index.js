@@ -17,19 +17,27 @@ mongoose.connect(config.MONGODB_URI)
 
 // Middleware to check if user exists and create if not
 bot.use(async (ctx, next) => {
-  if (ctx.from) {
-    const userId = ctx.from.id.toString();
-    const user = await User.findOne({ userId });
-    
-    if (!user) {
-      await User.create({
-        userId,
-        username: ctx.from.username || 'unknown',
-        firstName: ctx.from.first_name || 'unknown',
-        limit: 0,
-        isAdmin: ctx.from.username === config.ADMIN_USERNAME
-      });
+  try {
+    if (ctx.from) {
+      const userId = ctx.from.id.toString();
+      const user = await User.findOne({ userId });
+      
+      if (!user) {
+        // Use findOneAndUpdate with upsert to prevent duplicate key errors
+        await User.findOneAndUpdate(
+          { userId },
+          {
+            username: ctx.from.username || 'unknown',
+            firstName: ctx.from.first_name || 'unknown',
+            limit: 0,
+            isAdmin: ctx.from.username === config.ADMIN_USERNAME
+          },
+          { upsert: true, new: true }
+        );
+      }
     }
+  } catch (error) {
+    console.error('Error in user middleware:', error);
   }
   return next();
 });
