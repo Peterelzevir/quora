@@ -474,7 +474,7 @@ bot.action('process_order', async (ctx) => {
       return;
     }
     
-    if (service1.price > 10000 || service2.price > 150000) {
+    if (service1.price > 7000 || service2.price > 40000) {
       // Refund the user's limit
       await User.findOneAndUpdate(
         { userId },
