@@ -54,6 +54,21 @@ const getSession = (ctx) => {
   return sessions[userId];
 };
 
+// API Request Helper Function
+const makeApiRequest = async (data) => {
+  const options = {
+    method: 'POST',
+    url: config.API_URL,
+    headers: {
+      'Content-Type': 'application/x-www-form-urlencoded',
+      'User-Agent': 'TelegramBot/1.0'
+    },
+    data: data
+  };
+
+  return await axios.request(options);
+};
+
 // Start command
 bot.start(async (ctx) => {
   const userId = ctx.from.id.toString();
@@ -465,12 +480,12 @@ bot.action('process_order', async (ctx) => {
   // First, check available services
   try {
     console.log('Making services API request to:', config.API_URL);
-    console.log('Request parameters: api_key, action=services, secret_key');
     
-    const servicesResponse = await axios.post(config.API_URL, {
-      api_key: '72crqbuf4xi8enlp82agfdb5yhtx17c9',
+    // Using the new API request format
+    const servicesResponse = await makeApiRequest({
+      api_key: config.API_KEY,
       action: 'services',
-      secret_key: 'n74pdp63j071juiqxye52lkiw61rcc29rzgxsbmkasudo4l89o'
+      secret_key: config.SECRET_KEY
     });
     
     console.log('Services API response status:', servicesResponse.status);
@@ -486,7 +501,7 @@ bot.action('process_order', async (ctx) => {
       );
       
       await ctx.editMessageText('❌ *Order Failed*\n\nCould not fetch services from provider. Error: ' + 
-        (servicesResponse.data.error || 'Unknown error') + 
+        (servicesResponse.data.error || servicesResponse.data.data?.msg || 'Unknown error') + 
         '\n\nYour limit has been refunded.', {
         parse_mode: 'Markdown',
         ...Markup.inlineKeyboard([[Markup.button.callback('🔙 Back', 'back_to_main')]])
@@ -557,12 +572,12 @@ bot.action('process_order', async (ctx) => {
         
         console.log(`Processing link ${index + 1}/${links.length}: ${link}`);
         
-        // Process first service
+        // Process first service using the new API request format
         console.log(`Placing order for service ${config.SERVICE_ID_1}`);
-        const order1Response = await axios.post(config.API_URL, {
-          api_key: '72crqbuf4xi8enlp82agfdb5yhtx17c9',
+        const order1Response = await makeApiRequest({
+          api_key: config.API_KEY,
           action: 'order',
-          secret_key: 'n74pdp63j071juiqxye52lkiw61rcc29rzgxsbmkasudo4l89o',
+          secret_key: config.SECRET_KEY,
           service: config.SERVICE_ID_1,
           data: link,
           quantity: config.QUANTITY_1
@@ -570,9 +585,9 @@ bot.action('process_order', async (ctx) => {
         
         console.log(`Service ${config.SERVICE_ID_1} response:`, order1Response.data);
         
-        // Process second service
+        // Process second service using the new API request format
         console.log(`Placing order for service ${config.SERVICE_ID_2}`);
-        const order2Response = await axios.post(config.API_URL, {
+        const order2Response = await makeApiRequest({
           api_key: config.API_KEY,
           action: 'order',
           secret_key: config.SECRET_KEY,
@@ -717,55 +732,64 @@ bot.action('cancel_order', async (ctx) => {
 // Order history
 bot.action('order_history', async (ctx) => {
   const userId = ctx.from.id.toString();
-  const orders = await Order.find({ userId }).sort({ createdAt: -1 }).limit(20);
   
-  if (orders.length === 0) {
-    await ctx.editMessageText('📜 *Order History*\n\nYou haven\'t placed any orders yet.', {
+  try {
+    const orders = await Order.find({ userId }).sort({ createdAt: -1 }).limit(20);
+    
+    if (orders.length === 0) {
+      await ctx.editMessageText('📜 *Order History*\n\nYou haven\'t placed any orders yet.', {
+        parse_mode: 'Markdown',
+        ...Markup.inlineKeyboard([[Markup.button.callback('🔙 Back', 'back_to_main')]])
+      });
+      return;
+    }
+    
+    let message = '📜 *Your Order History*\n\n';
+    const buttons = [];
+    
+    orders.forEach((order, index) => {
+      // Format date in readable format
+      const orderDate = new Date(order.createdAt);
+      const formattedDate = `${orderDate.getDate()}/${orderDate.getMonth() + 1}/${orderDate.getFullYear()} ${orderDate.getHours()}:${String(orderDate.getMinutes()).padStart(2, '0')}`;
+      
+      // Truncate link if too long
+      const displayLink = order.link.length > 30 ? `${order.link.substring(0, 27)}...` : order.link;
+      
+      message += `${index + 1}. ${formattedDate}\n   Status: ${order.status}\n   Link: ${displayLink}\n\n`;
+      
+      // Add button row for each order
+      buttons.push([Markup.button.callback(`📊 Check Status #${index + 1}`, `check_status_${order._id}`)]);
+    });
+    
+    // Add back button
+    buttons.push([Markup.button.callback('🔙 Back', 'back_to_main')]);
+    
+    if (message.length > 4000) {
+      // If message is too long, create a file
+      fs.writeFileSync('order_history.txt', message.replace(/\*/g, ''));
+      
+      await ctx.replyWithDocument({ source: 'order_history.txt' }, {
+        caption: '📜 Your order history has been exported to this file.',
+        ...Markup.inlineKeyboard(buttons)
+      });
+      
+      fs.unlinkSync('order_history.txt');
+      
+      await ctx.editMessageText('📜 *Order History*\n\nYour order history has been sent as a file due to its length.', {
+        parse_mode: 'Markdown',
+        ...Markup.inlineKeyboard([[Markup.button.callback('🔙 Back', 'back_to_main')]])
+      });
+    } else {
+      await ctx.editMessageText(message, {
+        parse_mode: 'Markdown',
+        ...Markup.inlineKeyboard(buttons)
+      });
+    }
+  } catch (error) {
+    console.error('Error fetching order history:', error);
+    await ctx.editMessageText('❌ Error fetching your order history. Please try again.', {
       parse_mode: 'Markdown',
       ...Markup.inlineKeyboard([[Markup.button.callback('🔙 Back', 'back_to_main')]])
-    });
-    return;
-  }
-  
-  let message = '📜 *Your Order History*\n\n';
-  const buttons = [];
-  
-  orders.forEach((order, index) => {
-    // Format date in readable format
-    const orderDate = new Date(order.createdAt);
-    const formattedDate = `${orderDate.getDate()}/${orderDate.getMonth() + 1}/${orderDate.getFullYear()} ${orderDate.getHours()}:${String(orderDate.getMinutes()).padStart(2, '0')}`;
-    
-    // Truncate link if too long
-    const displayLink = order.link.length > 30 ? `${order.link.substring(0, 27)}...` : order.link;
-    
-    message += `${index + 1}. ${formattedDate}\n   Status: ${order.status}\n   Link: ${displayLink}\n\n`;
-    
-    // Add button row for each order
-    buttons.push([Markup.button.callback(`📊 Check Status #${index + 1}`, `check_status_${order._id}`)]);
-  });
-  
-  // Add back button
-  buttons.push([Markup.button.callback('🔙 Back', 'back_to_main')]);
-  
-  if (message.length > 4000) {
-    // If message is too long, create a file
-    fs.writeFileSync('order_history.txt', message.replace(/\*/g, ''));
-    
-    await ctx.replyWithDocument({ source: 'order_history.txt' }, {
-      caption: '📜 Your order history has been exported to this file.',
-      ...Markup.inlineKeyboard(buttons)
-    });
-    
-    fs.unlinkSync('order_history.txt');
-    
-    await ctx.editMessageText('📜 *Order History*\n\nYour order history has been sent as a file due to its length.', {
-      parse_mode: 'Markdown',
-      ...Markup.inlineKeyboard([[Markup.button.callback('🔙 Back', 'back_to_main')]])
-    });
-  } else {
-    await ctx.editMessageText(message, {
-      parse_mode: 'Markdown',
-      ...Markup.inlineKeyboard(buttons)
     });
   }
 });
@@ -785,16 +809,16 @@ bot.action(/check_status_(.+)/, async (ctx) => {
   });
   
   try {
-    // Check status for first order
-    const status1Response = await axios.post(config.API_URL, {
+    // Check status for first order using the new API request format
+    const status1Response = await makeApiRequest({
       api_key: config.API_KEY,
       action: 'status',
       secret_key: config.SECRET_KEY,
       id: order.order1Id
     });
     
-    // Check status for second order
-    const status2Response = await axios.post(config.API_URL, {
+    // Check status for second order using the new API request format
+    const status2Response = await makeApiRequest({
       api_key: config.API_KEY,
       action: 'status',
       secret_key: config.SECRET_KEY,
